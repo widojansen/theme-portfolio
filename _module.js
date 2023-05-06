@@ -204,6 +204,14 @@ function attr(node, attribute, value) {
     else if (node.getAttribute(attribute) !== value)
         node.setAttribute(attribute, value);
 }
+/**
+ * List of attributes that should always be set through the attr method,
+ * because updating them through the property setter doesn't work reliably.
+ * In the example of `width`/`height`, the problem is that the setter only
+ * accepts numeric values, but the attribute can also be set to a string like `50%`.
+ * If this list becomes too big, rethink this approach.
+ */
+const always_set_through_set_attribute = ['width', 'height'];
 function set_attributes(node, attributes) {
     // @ts-ignore
     const descriptors = Object.getOwnPropertyDescriptors(node.__proto__);
@@ -217,7 +225,7 @@ function set_attributes(node, attributes) {
         else if (key === '__value') {
             node.value = node[key] = attributes[key];
         }
-        else if (descriptors[key] && descriptors[key].set) {
+        else if (descriptors[key] && descriptors[key].set && always_set_through_set_attribute.indexOf(key) === -1) {
             node[key] = attributes[key];
         }
         else {
@@ -838,19 +846,17 @@ function create_fragment(ctx) {
 function instance($$self, $$props, $$invalidate) {
 	let { favicon } = $$props;
 	let { site_nav } = $$props;
-	let { social_links } = $$props;
 	let { title } = $$props;
 	let { description } = $$props;
 
 	$$self.$$set = $$props => {
 		if ('favicon' in $$props) $$invalidate(0, favicon = $$props.favicon);
 		if ('site_nav' in $$props) $$invalidate(3, site_nav = $$props.site_nav);
-		if ('social_links' in $$props) $$invalidate(4, social_links = $$props.social_links);
 		if ('title' in $$props) $$invalidate(1, title = $$props.title);
 		if ('description' in $$props) $$invalidate(2, description = $$props.description);
 	};
 
-	return [favicon, title, description, site_nav, social_links];
+	return [favicon, title, description, site_nav];
 }
 
 class Component extends SvelteComponent {
@@ -860,7 +866,6 @@ class Component extends SvelteComponent {
 		init(this, options, instance, create_fragment, safe_not_equal, {
 			favicon: 0,
 			site_nav: 3,
-			social_links: 4,
 			title: 1,
 			description: 2
 		});
@@ -2786,11 +2791,11 @@ function create_each_block(ctx) {
 		},
 		p(ctx, dirty) {
 			const icon_changes = {};
-			if (dirty & /*social_links*/ 1) icon_changes.icon = /*icon*/ ctx[8];
+			if (dirty & /*social_links*/ 8) icon_changes.icon = /*icon*/ ctx[8];
 			icon.$set(icon_changes);
-			if ((!current || dirty & /*social_links*/ 1) && t1_value !== (t1_value = /*link*/ ctx[7].label + "")) set_data(t1, t1_value);
+			if ((!current || dirty & /*social_links*/ 8) && t1_value !== (t1_value = /*link*/ ctx[7].label + "")) set_data(t1, t1_value);
 
-			if (!current || dirty & /*social_links*/ 1 && a_href_value !== (a_href_value = /*link*/ ctx[7].url)) {
+			if (!current || dirty & /*social_links*/ 8 && a_href_value !== (a_href_value = /*link*/ ctx[7].url)) {
 				attr(a, "href", a_href_value);
 			}
 		},
@@ -2825,11 +2830,11 @@ function create_fragment$2(ctx) {
 	let t1;
 	let t2;
 	let div0;
-	let raw_value = /*description*/ ctx[1].html + "";
+	let raw_value = /*description*/ ctx[0].html + "";
 	let t3;
 	let ul;
 	let current;
-	let each_value = /*social_links*/ ctx[0];
+	let each_value = /*social_links*/ ctx[3];
 	let each_blocks = [];
 
 	for (let i = 0; i < each_value.length; i += 1) {
@@ -2851,7 +2856,7 @@ function create_fragment$2(ctx) {
 			t0 = space();
 			div1 = element("div");
 			h1 = element("h1");
-			t1 = text(/*name*/ ctx[3]);
+			t1 = text(/*name*/ ctx[2]);
 			t2 = space();
 			div0 = element("div");
 			t3 = space();
@@ -2881,7 +2886,7 @@ function create_fragment$2(ctx) {
 			var div1_nodes = children(div1);
 			h1 = claim_element(div1_nodes, "H1", { class: true });
 			var h1_nodes = children(h1);
-			t1 = claim_text(h1_nodes, /*name*/ ctx[3]);
+			t1 = claim_text(h1_nodes, /*name*/ ctx[2]);
 			h1_nodes.forEach(detach);
 			t2 = claim_space(div1_nodes);
 			div0 = claim_element(div1_nodes, "DIV", { class: true });
@@ -2904,11 +2909,11 @@ function create_fragment$2(ctx) {
 			this.h();
 		},
 		h() {
-			if (!src_url_equal(img.src, img_src_value = /*portrait*/ ctx[2].image.url)) attr(img, "src", img_src_value);
-			attr(img, "alt", img_alt_value = /*portrait*/ ctx[2].image.alt);
+			if (!src_url_equal(img.src, img_src_value = /*portrait*/ ctx[1].image.url)) attr(img, "src", img_src_value);
+			attr(img, "alt", img_alt_value = /*portrait*/ ctx[1].image.alt);
 			attr(img, "class", "svelte-1byd7us");
 			attr(figure, "class", "svelte-1byd7us");
-			toggle_class(figure, "square", /*portrait*/ ctx[2].variation === "square");
+			toggle_class(figure, "square", /*portrait*/ ctx[1].variation === "square");
 			attr(h1, "class", "headline svelte-1byd7us");
 			attr(div0, "class", "description svelte-1byd7us");
 			attr(ul, "class", "social svelte-1byd7us");
@@ -2944,22 +2949,22 @@ function create_fragment$2(ctx) {
 			current = true;
 		},
 		p(ctx, [dirty]) {
-			if (!current || dirty & /*portrait*/ 4 && !src_url_equal(img.src, img_src_value = /*portrait*/ ctx[2].image.url)) {
+			if (!current || dirty & /*portrait*/ 2 && !src_url_equal(img.src, img_src_value = /*portrait*/ ctx[1].image.url)) {
 				attr(img, "src", img_src_value);
 			}
 
-			if (!current || dirty & /*portrait*/ 4 && img_alt_value !== (img_alt_value = /*portrait*/ ctx[2].image.alt)) {
+			if (!current || dirty & /*portrait*/ 2 && img_alt_value !== (img_alt_value = /*portrait*/ ctx[1].image.alt)) {
 				attr(img, "alt", img_alt_value);
 			}
 
-			if (!current || dirty & /*portrait*/ 4) {
-				toggle_class(figure, "square", /*portrait*/ ctx[2].variation === "square");
+			if (!current || dirty & /*portrait*/ 2) {
+				toggle_class(figure, "square", /*portrait*/ ctx[1].variation === "square");
 			}
 
-			if (!current || dirty & /*name*/ 8) set_data(t1, /*name*/ ctx[3]);
-			if ((!current || dirty & /*description*/ 2) && raw_value !== (raw_value = /*description*/ ctx[1].html + "")) div0.innerHTML = raw_value;
-			if (dirty & /*social_links*/ 1) {
-				each_value = /*social_links*/ ctx[0];
+			if (!current || dirty & /*name*/ 4) set_data(t1, /*name*/ ctx[2]);
+			if ((!current || dirty & /*description*/ 1) && raw_value !== (raw_value = /*description*/ ctx[0].html + "")) div0.innerHTML = raw_value;
+			if (dirty & /*social_links*/ 8) {
+				each_value = /*social_links*/ ctx[3];
 				let i;
 
 				for (i = 0; i < each_value.length; i += 1) {
@@ -3013,23 +3018,23 @@ function create_fragment$2(ctx) {
 function instance$2($$self, $$props, $$invalidate) {
 	let { favicon } = $$props;
 	let { site_nav } = $$props;
-	let { social_links } = $$props;
 	let { title } = $$props;
 	let { description } = $$props;
 	let { portrait } = $$props;
 	let { name } = $$props;
+	let { social_links } = $$props;
 
 	$$self.$$set = $$props => {
 		if ('favicon' in $$props) $$invalidate(4, favicon = $$props.favicon);
 		if ('site_nav' in $$props) $$invalidate(5, site_nav = $$props.site_nav);
-		if ('social_links' in $$props) $$invalidate(0, social_links = $$props.social_links);
 		if ('title' in $$props) $$invalidate(6, title = $$props.title);
-		if ('description' in $$props) $$invalidate(1, description = $$props.description);
-		if ('portrait' in $$props) $$invalidate(2, portrait = $$props.portrait);
-		if ('name' in $$props) $$invalidate(3, name = $$props.name);
+		if ('description' in $$props) $$invalidate(0, description = $$props.description);
+		if ('portrait' in $$props) $$invalidate(1, portrait = $$props.portrait);
+		if ('name' in $$props) $$invalidate(2, name = $$props.name);
+		if ('social_links' in $$props) $$invalidate(3, social_links = $$props.social_links);
 	};
 
-	return [social_links, description, portrait, name, favicon, site_nav, title];
+	return [description, portrait, name, social_links, favicon, site_nav, title];
 }
 
 class Component$2 extends SvelteComponent {
@@ -3039,11 +3044,11 @@ class Component$2 extends SvelteComponent {
 		init(this, options, instance$2, create_fragment$2, safe_not_equal, {
 			favicon: 4,
 			site_nav: 5,
-			social_links: 0,
 			title: 6,
-			description: 1,
-			portrait: 2,
-			name: 3
+			description: 0,
+			portrait: 1,
+			name: 2,
+			social_links: 3
 		});
 	}
 }
@@ -3107,7 +3112,6 @@ function create_fragment$3(ctx) {
 function instance$3($$self, $$props, $$invalidate) {
 	let { favicon } = $$props;
 	let { site_nav } = $$props;
-	let { social_links } = $$props;
 	let { title } = $$props;
 	let { description } = $$props;
 	let { content } = $$props;
@@ -3115,13 +3119,12 @@ function instance$3($$self, $$props, $$invalidate) {
 	$$self.$$set = $$props => {
 		if ('favicon' in $$props) $$invalidate(1, favicon = $$props.favicon);
 		if ('site_nav' in $$props) $$invalidate(2, site_nav = $$props.site_nav);
-		if ('social_links' in $$props) $$invalidate(3, social_links = $$props.social_links);
-		if ('title' in $$props) $$invalidate(4, title = $$props.title);
-		if ('description' in $$props) $$invalidate(5, description = $$props.description);
+		if ('title' in $$props) $$invalidate(3, title = $$props.title);
+		if ('description' in $$props) $$invalidate(4, description = $$props.description);
 		if ('content' in $$props) $$invalidate(0, content = $$props.content);
 	};
 
-	return [content, favicon, site_nav, social_links, title, description];
+	return [content, favicon, site_nav, title, description];
 }
 
 class Component$3 extends SvelteComponent {
@@ -3131,9 +3134,8 @@ class Component$3 extends SvelteComponent {
 		init(this, options, instance$3, create_fragment$3, safe_not_equal, {
 			favicon: 1,
 			site_nav: 2,
-			social_links: 3,
-			title: 4,
-			description: 5,
+			title: 3,
+			description: 4,
 			content: 0
 		});
 	}
@@ -3143,22 +3145,22 @@ class Component$3 extends SvelteComponent {
 
 function get_each_context$1(ctx, list, i) {
 	const child_ctx = ctx.slice();
-	child_ctx[7] = list[i].label;
-	child_ctx[8] = list[i].icon;
+	child_ctx[6] = list[i].label;
+	child_ctx[7] = list[i].icon;
 	return child_ctx;
 }
 
-// (46:4) {#each items as {label,icon}}
+// (45:4) {#each items as {label,icon}}
 function create_each_block$1(ctx) {
 	let li;
 	let icon;
 	let t0;
 	let span;
-	let t1_value = /*label*/ ctx[7] + "";
+	let t1_value = /*label*/ ctx[6] + "";
 	let t1;
 	let t2;
 	let current;
-	icon = new Component$1({ props: { icon: /*icon*/ ctx[8] } });
+	icon = new Component$1({ props: { icon: /*icon*/ ctx[7] } });
 
 	return {
 		c() {
@@ -3197,9 +3199,9 @@ function create_each_block$1(ctx) {
 		},
 		p(ctx, dirty) {
 			const icon_changes = {};
-			if (dirty & /*items*/ 4) icon_changes.icon = /*icon*/ ctx[8];
+			if (dirty & /*items*/ 4) icon_changes.icon = /*icon*/ ctx[7];
 			icon.$set(icon_changes);
-			if ((!current || dirty & /*items*/ 4) && t1_value !== (t1_value = /*label*/ ctx[7] + "")) set_data(t1, t1_value);
+			if ((!current || dirty & /*items*/ 4) && t1_value !== (t1_value = /*label*/ ctx[6] + "")) set_data(t1, t1_value);
 		},
 		i(local) {
 			if (current) return;
@@ -3374,7 +3376,6 @@ function create_fragment$4(ctx) {
 function instance$4($$self, $$props, $$invalidate) {
 	let { favicon } = $$props;
 	let { site_nav } = $$props;
-	let { social_links } = $$props;
 	let { title } = $$props;
 	let { description } = $$props;
 	let { heading } = $$props;
@@ -3383,14 +3384,13 @@ function instance$4($$self, $$props, $$invalidate) {
 	$$self.$$set = $$props => {
 		if ('favicon' in $$props) $$invalidate(3, favicon = $$props.favicon);
 		if ('site_nav' in $$props) $$invalidate(4, site_nav = $$props.site_nav);
-		if ('social_links' in $$props) $$invalidate(5, social_links = $$props.social_links);
-		if ('title' in $$props) $$invalidate(6, title = $$props.title);
+		if ('title' in $$props) $$invalidate(5, title = $$props.title);
 		if ('description' in $$props) $$invalidate(0, description = $$props.description);
 		if ('heading' in $$props) $$invalidate(1, heading = $$props.heading);
 		if ('items' in $$props) $$invalidate(2, items = $$props.items);
 	};
 
-	return [description, heading, items, favicon, site_nav, social_links, title];
+	return [description, heading, items, favicon, site_nav, title];
 }
 
 class Component$4 extends SvelteComponent {
@@ -3400,8 +3400,7 @@ class Component$4 extends SvelteComponent {
 		init(this, options, instance$4, create_fragment$4, safe_not_equal, {
 			favicon: 3,
 			site_nav: 4,
-			social_links: 5,
-			title: 6,
+			title: 5,
 			description: 0,
 			heading: 1,
 			items: 2
@@ -3413,20 +3412,20 @@ class Component$4 extends SvelteComponent {
 
 function get_each_context$2(ctx, list, i) {
 	const child_ctx = ctx.slice();
-	child_ctx[7] = list[i];
+	child_ctx[6] = list[i];
 	return child_ctx;
 }
 
 function get_each_context_1(ctx, list, i) {
 	const child_ctx = ctx.slice();
-	child_ctx[10] = list[i].link;
+	child_ctx[9] = list[i].link;
 	return child_ctx;
 }
 
-// (79:12) {#each item.links as {link}}
+// (78:12) {#each item.links as {link}}
 function create_each_block_1(ctx) {
 	let a;
-	let t_value = /*link*/ ctx[10].label + "";
+	let t_value = /*link*/ ctx[9].label + "";
 	let t;
 	let a_href_value;
 
@@ -3445,16 +3444,16 @@ function create_each_block_1(ctx) {
 		},
 		h() {
 			attr(a, "class", "link");
-			attr(a, "href", a_href_value = /*link*/ ctx[10].url);
+			attr(a, "href", a_href_value = /*link*/ ctx[9].url);
 		},
 		m(target, anchor) {
 			insert_hydration(target, a, anchor);
 			append_hydration(a, t);
 		},
 		p(ctx, dirty) {
-			if (dirty & /*items*/ 2 && t_value !== (t_value = /*link*/ ctx[10].label + "")) set_data(t, t_value);
+			if (dirty & /*items*/ 2 && t_value !== (t_value = /*link*/ ctx[9].label + "")) set_data(t, t_value);
 
-			if (dirty & /*items*/ 2 && a_href_value !== (a_href_value = /*link*/ ctx[10].url)) {
+			if (dirty & /*items*/ 2 && a_href_value !== (a_href_value = /*link*/ ctx[9].url)) {
 				attr(a, "href", a_href_value);
 			}
 		},
@@ -3464,7 +3463,7 @@ function create_each_block_1(ctx) {
 	};
 }
 
-// (84:8) {#if item.thumbnail.url}
+// (83:8) {#if item.thumbnail.url}
 function create_if_block$1(ctx) {
 	let img;
 	let img_src_value;
@@ -3480,19 +3479,19 @@ function create_if_block$1(ctx) {
 			this.h();
 		},
 		h() {
-			if (!src_url_equal(img.src, img_src_value = /*item*/ ctx[7].thumbnail.url)) attr(img, "src", img_src_value);
-			attr(img, "alt", img_alt_value = /*item*/ ctx[7].thumbnail.alt);
+			if (!src_url_equal(img.src, img_src_value = /*item*/ ctx[6].thumbnail.url)) attr(img, "src", img_src_value);
+			attr(img, "alt", img_alt_value = /*item*/ ctx[6].thumbnail.alt);
 			attr(img, "class", "svelte-hf1yy6");
 		},
 		m(target, anchor) {
 			insert_hydration(target, img, anchor);
 		},
 		p(ctx, dirty) {
-			if (dirty & /*items*/ 2 && !src_url_equal(img.src, img_src_value = /*item*/ ctx[7].thumbnail.url)) {
+			if (dirty & /*items*/ 2 && !src_url_equal(img.src, img_src_value = /*item*/ ctx[6].thumbnail.url)) {
 				attr(img, "src", img_src_value);
 			}
 
-			if (dirty & /*items*/ 2 && img_alt_value !== (img_alt_value = /*item*/ ctx[7].thumbnail.alt)) {
+			if (dirty & /*items*/ 2 && img_alt_value !== (img_alt_value = /*item*/ ctx[6].thumbnail.alt)) {
 				attr(img, "alt", img_alt_value);
 			}
 		},
@@ -3502,32 +3501,32 @@ function create_if_block$1(ctx) {
 	};
 }
 
-// (72:6) {#each items as item}
+// (71:6) {#each items as item}
 function create_each_block$2(ctx) {
 	let li;
 	let div2;
 	let span;
-	let t0_value = /*item*/ ctx[7].date + "";
+	let t0_value = /*item*/ ctx[6].date + "";
 	let t0;
 	let t1;
 	let h3;
-	let t2_value = /*item*/ ctx[7].title + "";
+	let t2_value = /*item*/ ctx[6].title + "";
 	let t2;
 	let t3;
 	let div0;
-	let raw_value = /*item*/ ctx[7].description.html + "";
+	let raw_value = /*item*/ ctx[6].description.html + "";
 	let t4;
 	let div1;
 	let t5;
 	let t6;
-	let each_value_1 = /*item*/ ctx[7].links;
+	let each_value_1 = /*item*/ ctx[6].links;
 	let each_blocks = [];
 
 	for (let i = 0; i < each_value_1.length; i += 1) {
 		each_blocks[i] = create_each_block_1(get_each_context_1(ctx, each_value_1, i));
 	}
 
-	let if_block = /*item*/ ctx[7].thumbnail.url && create_if_block$1(ctx);
+	let if_block = /*item*/ ctx[6].thumbnail.url && create_if_block$1(ctx);
 
 	return {
 		c() {
@@ -3619,11 +3618,11 @@ function create_each_block$2(ctx) {
 			append_hydration(li, t6);
 		},
 		p(ctx, dirty) {
-			if (dirty & /*items*/ 2 && t0_value !== (t0_value = /*item*/ ctx[7].date + "")) set_data(t0, t0_value);
-			if (dirty & /*items*/ 2 && t2_value !== (t2_value = /*item*/ ctx[7].title + "")) set_data(t2, t2_value);
-			if (dirty & /*items*/ 2 && raw_value !== (raw_value = /*item*/ ctx[7].description.html + "")) div0.innerHTML = raw_value;
+			if (dirty & /*items*/ 2 && t0_value !== (t0_value = /*item*/ ctx[6].date + "")) set_data(t0, t0_value);
+			if (dirty & /*items*/ 2 && t2_value !== (t2_value = /*item*/ ctx[6].title + "")) set_data(t2, t2_value);
+			if (dirty & /*items*/ 2 && raw_value !== (raw_value = /*item*/ ctx[6].description.html + "")) div0.innerHTML = raw_value;
 			if (dirty & /*items*/ 2) {
-				each_value_1 = /*item*/ ctx[7].links;
+				each_value_1 = /*item*/ ctx[6].links;
 				let i;
 
 				for (i = 0; i < each_value_1.length; i += 1) {
@@ -3645,7 +3644,7 @@ function create_each_block$2(ctx) {
 				each_blocks.length = each_value_1.length;
 			}
 
-			if (/*item*/ ctx[7].thumbnail.url) {
+			if (/*item*/ ctx[6].thumbnail.url) {
 				if (if_block) {
 					if_block.p(ctx, dirty);
 				} else {
@@ -3789,7 +3788,6 @@ function create_fragment$5(ctx) {
 function instance$5($$self, $$props, $$invalidate) {
 	let { favicon } = $$props;
 	let { site_nav } = $$props;
-	let { social_links } = $$props;
 	let { title } = $$props;
 	let { description } = $$props;
 	let { heading } = $$props;
@@ -3798,14 +3796,13 @@ function instance$5($$self, $$props, $$invalidate) {
 	$$self.$$set = $$props => {
 		if ('favicon' in $$props) $$invalidate(2, favicon = $$props.favicon);
 		if ('site_nav' in $$props) $$invalidate(3, site_nav = $$props.site_nav);
-		if ('social_links' in $$props) $$invalidate(4, social_links = $$props.social_links);
-		if ('title' in $$props) $$invalidate(5, title = $$props.title);
-		if ('description' in $$props) $$invalidate(6, description = $$props.description);
+		if ('title' in $$props) $$invalidate(4, title = $$props.title);
+		if ('description' in $$props) $$invalidate(5, description = $$props.description);
 		if ('heading' in $$props) $$invalidate(0, heading = $$props.heading);
 		if ('items' in $$props) $$invalidate(1, items = $$props.items);
 	};
 
-	return [heading, items, favicon, site_nav, social_links, title, description];
+	return [heading, items, favicon, site_nav, title, description];
 }
 
 class Component$5 extends SvelteComponent {
@@ -3815,9 +3812,8 @@ class Component$5 extends SvelteComponent {
 		init(this, options, instance$5, create_fragment$5, safe_not_equal, {
 			favicon: 2,
 			site_nav: 3,
-			social_links: 4,
-			title: 5,
-			description: 6,
+			title: 4,
+			description: 5,
 			heading: 0,
 			items: 1
 		});
@@ -3883,14 +3879,14 @@ function create_each_block$3(ctx) {
 		},
 		p(ctx, dirty) {
 			const icon_changes = {};
-			if (dirty & /*social_links*/ 1) icon_changes.icon = /*icon*/ ctx[8];
+			if (dirty & /*social_links*/ 4) icon_changes.icon = /*icon*/ ctx[8];
 			icon.$set(icon_changes);
 
-			if (!current || dirty & /*social_links*/ 1 && a_href_value !== (a_href_value = /*link*/ ctx[7].url)) {
+			if (!current || dirty & /*social_links*/ 4 && a_href_value !== (a_href_value = /*link*/ ctx[7].url)) {
 				attr(a, "href", a_href_value);
 			}
 
-			if (!current || dirty & /*social_links*/ 1 && a_aria_label_value !== (a_aria_label_value = /*icon*/ ctx[8])) {
+			if (!current || dirty & /*social_links*/ 4 && a_aria_label_value !== (a_aria_label_value = /*icon*/ ctx[8])) {
 				attr(a, "aria-label", a_aria_label_value);
 			}
 		},
@@ -3942,7 +3938,7 @@ function create_fragment$6(ctx) {
 	let ul;
 	let current;
 	icon = new Component$1({ props: { icon: "mdi:envelope" } });
-	let each_value = /*social_links*/ ctx[0];
+	let each_value = /*social_links*/ ctx[2];
 	let each_blocks = [];
 
 	for (let i = 0; i < each_value.length; i += 1) {
@@ -3961,13 +3957,13 @@ function create_fragment$6(ctx) {
 			div2 = element("div");
 			div0 = element("div");
 			h2 = element("h2");
-			t0 = text(/*heading*/ ctx[1]);
+			t0 = text(/*heading*/ ctx[0]);
 			t1 = space();
 			a0 = element("a");
 			create_component(icon.$$.fragment);
 			t2 = space();
 			span0 = element("span");
-			t3 = text(/*email*/ ctx[2]);
+			t3 = text(/*email*/ ctx[1]);
 			t4 = space();
 			hr = element("hr");
 			t5 = space();
@@ -4002,7 +3998,7 @@ function create_fragment$6(ctx) {
 			var div0_nodes = children(div0);
 			h2 = claim_element(div0_nodes, "H2", { class: true });
 			var h2_nodes = children(h2);
-			t0 = claim_text(h2_nodes, /*heading*/ ctx[1]);
+			t0 = claim_text(h2_nodes, /*heading*/ ctx[0]);
 			h2_nodes.forEach(detach);
 			t1 = claim_space(div0_nodes);
 			a0 = claim_element(div0_nodes, "A", { class: true, href: true });
@@ -4011,7 +4007,7 @@ function create_fragment$6(ctx) {
 			t2 = claim_space(a0_nodes);
 			span0 = claim_element(a0_nodes, "SPAN", { class: true });
 			var span0_nodes = children(span0);
-			t3 = claim_text(span0_nodes, /*email*/ ctx[2]);
+			t3 = claim_text(span0_nodes, /*email*/ ctx[1]);
 			span0_nodes.forEach(detach);
 			a0_nodes.forEach(detach);
 			div0_nodes.forEach(detach);
@@ -4054,7 +4050,7 @@ function create_fragment$6(ctx) {
 			attr(h2, "class", "heading");
 			attr(span0, "class", "svelte-i8f0ga");
 			attr(a0, "class", "email svelte-i8f0ga");
-			attr(a0, "href", a0_href_value = "mailto:" + /*email*/ ctx[2]);
+			attr(a0, "href", a0_href_value = "mailto:" + /*email*/ ctx[1]);
 			attr(div0, "class", "primary svelte-i8f0ga");
 			attr(span1, "class", "copyright svelte-i8f0ga");
 			attr(a1, "href", "https://primo.so");
@@ -4105,15 +4101,15 @@ function create_fragment$6(ctx) {
 			current = true;
 		},
 		p(ctx, [dirty]) {
-			if (!current || dirty & /*heading*/ 2) set_data(t0, /*heading*/ ctx[1]);
-			if (!current || dirty & /*email*/ 4) set_data(t3, /*email*/ ctx[2]);
+			if (!current || dirty & /*heading*/ 1) set_data(t0, /*heading*/ ctx[0]);
+			if (!current || dirty & /*email*/ 2) set_data(t3, /*email*/ ctx[1]);
 
-			if (!current || dirty & /*email*/ 4 && a0_href_value !== (a0_href_value = "mailto:" + /*email*/ ctx[2])) {
+			if (!current || dirty & /*email*/ 2 && a0_href_value !== (a0_href_value = "mailto:" + /*email*/ ctx[1])) {
 				attr(a0, "href", a0_href_value);
 			}
 
-			if (dirty & /*social_links*/ 1) {
-				each_value = /*social_links*/ ctx[0];
+			if (dirty & /*social_links*/ 4) {
+				each_value = /*social_links*/ ctx[2];
 				let i;
 
 				for (i = 0; i < each_value.length; i += 1) {
@@ -4170,23 +4166,23 @@ function create_fragment$6(ctx) {
 function instance$6($$self, $$props, $$invalidate) {
 	let { favicon } = $$props;
 	let { site_nav } = $$props;
-	let { social_links } = $$props;
 	let { title } = $$props;
 	let { description } = $$props;
 	let { heading } = $$props;
 	let { email } = $$props;
+	let { social_links } = $$props;
 
 	$$self.$$set = $$props => {
 		if ('favicon' in $$props) $$invalidate(3, favicon = $$props.favicon);
 		if ('site_nav' in $$props) $$invalidate(4, site_nav = $$props.site_nav);
-		if ('social_links' in $$props) $$invalidate(0, social_links = $$props.social_links);
 		if ('title' in $$props) $$invalidate(5, title = $$props.title);
 		if ('description' in $$props) $$invalidate(6, description = $$props.description);
-		if ('heading' in $$props) $$invalidate(1, heading = $$props.heading);
-		if ('email' in $$props) $$invalidate(2, email = $$props.email);
+		if ('heading' in $$props) $$invalidate(0, heading = $$props.heading);
+		if ('email' in $$props) $$invalidate(1, email = $$props.email);
+		if ('social_links' in $$props) $$invalidate(2, social_links = $$props.social_links);
 	};
 
-	return [social_links, heading, email, favicon, site_nav, title, description];
+	return [heading, email, social_links, favicon, site_nav, title, description];
 }
 
 class Component$6 extends SvelteComponent {
@@ -4196,11 +4192,11 @@ class Component$6 extends SvelteComponent {
 		init(this, options, instance$6, create_fragment$6, safe_not_equal, {
 			favicon: 3,
 			site_nav: 4,
-			social_links: 0,
 			title: 5,
 			description: 6,
-			heading: 1,
-			email: 2
+			heading: 0,
+			email: 1,
+			social_links: 2
 		});
 	}
 }
@@ -4210,19 +4206,17 @@ class Component$6 extends SvelteComponent {
 function instance$7($$self, $$props, $$invalidate) {
 	let { favicon } = $$props;
 	let { site_nav } = $$props;
-	let { social_links } = $$props;
 	let { title } = $$props;
 	let { description } = $$props;
 
 	$$self.$$set = $$props => {
 		if ('favicon' in $$props) $$invalidate(0, favicon = $$props.favicon);
 		if ('site_nav' in $$props) $$invalidate(1, site_nav = $$props.site_nav);
-		if ('social_links' in $$props) $$invalidate(2, social_links = $$props.social_links);
-		if ('title' in $$props) $$invalidate(3, title = $$props.title);
-		if ('description' in $$props) $$invalidate(4, description = $$props.description);
+		if ('title' in $$props) $$invalidate(2, title = $$props.title);
+		if ('description' in $$props) $$invalidate(3, description = $$props.description);
 	};
 
-	return [favicon, site_nav, social_links, title, description];
+	return [favicon, site_nav, title, description];
 }
 
 class Component$7 extends SvelteComponent {
@@ -4232,9 +4226,8 @@ class Component$7 extends SvelteComponent {
 		init(this, options, instance$7, null, safe_not_equal, {
 			favicon: 0,
 			site_nav: 1,
-			social_links: 2,
-			title: 3,
-			description: 4
+			title: 2,
+			description: 3
 		});
 	}
 }
@@ -4277,22 +4270,6 @@ function create_fragment$7(ctx) {
 						"link": { "url": "/projects", "label": "Projects" }
 					}
 				],
-				social_links: [
-					{
-						"icon": "mdi:twitter",
-						"link": {
-							"url": "https://twitter.com",
-							"label": "Twitter"
-						}
-					},
-					{
-						"icon": "mdi:github",
-						"link": {
-							"url": "https://github.com",
-							"label": "Github"
-						}
-					}
-				],
 				title: "Portfolio Template",
 				description: "Cupidatat est tempor"
 			}
@@ -4318,6 +4295,21 @@ function create_fragment$7(ctx) {
 						"link": { "url": "/projects", "label": "Projects" }
 					}
 				],
+				title: "Portfolio Template",
+				description: {
+					"html": "<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Id praesent feugiat libero maecenas urna, vel.</p>",
+					"markdown": "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Id praesent feugiat libero maecenas urna, vel.\n\n"
+				},
+				portrait: {
+					"image": {
+						"alt": "Profile photo of me",
+						"src": "https://images.unsplash.com/photo-1570158268183-d296b2892211?ixlib=rb-1.2.1&ixid=MnwxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8&auto=format&fit=crop&w=300&q=80",
+						"url": "https://images.unsplash.com/photo-1570158268183-d296b2892211?ixlib=rb-1.2.1&ixid=MnwxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8&auto=format&fit=crop&w=300&q=80",
+						"size": null
+					},
+					"variation": "circle"
+				},
+				name: "Abdelfatah Ahmed",
 				social_links: [
 					{
 						"icon": "mdi:twitter",
@@ -4335,22 +4327,7 @@ function create_fragment$7(ctx) {
 							"active": false
 						}
 					}
-				],
-				title: "Portfolio Template",
-				description: {
-					"html": "<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Id praesent feugiat libero maecenas urna, vel.</p>",
-					"markdown": "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Id praesent feugiat libero maecenas urna, vel.\n\n"
-				},
-				portrait: {
-					"image": {
-						"alt": "Profile photo of me",
-						"src": "https://images.unsplash.com/photo-1570158268183-d296b2892211?ixlib=rb-1.2.1&ixid=MnwxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8&auto=format&fit=crop&w=300&q=80",
-						"url": "https://images.unsplash.com/photo-1570158268183-d296b2892211?ixlib=rb-1.2.1&ixid=MnwxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8&auto=format&fit=crop&w=300&q=80",
-						"size": null
-					},
-					"variation": "circle"
-				},
-				name: "Abdelfatah Ahmed"
+				]
 			}
 		});
 
@@ -4372,22 +4349,6 @@ function create_fragment$7(ctx) {
 					},
 					{
 						"link": { "url": "/projects", "label": "Projects" }
-					}
-				],
-				social_links: [
-					{
-						"icon": "mdi:twitter",
-						"link": {
-							"url": "https://twitter.com",
-							"label": "Twitter"
-						}
-					},
-					{
-						"icon": "mdi:github",
-						"link": {
-							"url": "https://github.com",
-							"label": "Github"
-						}
 					}
 				],
 				title: "Portfolio Template",
@@ -4417,22 +4378,6 @@ function create_fragment$7(ctx) {
 					},
 					{
 						"link": { "url": "/projects", "label": "Projects" }
-					}
-				],
-				social_links: [
-					{
-						"icon": "mdi:twitter",
-						"link": {
-							"url": "https://twitter.com",
-							"label": "Twitter"
-						}
-					},
-					{
-						"icon": "mdi:github",
-						"link": {
-							"url": "https://github.com",
-							"label": "Github"
-						}
 					}
 				],
 				title: "Portfolio Template",
@@ -4477,22 +4422,6 @@ function create_fragment$7(ctx) {
 					},
 					{
 						"link": { "url": "/projects", "label": "Projects" }
-					}
-				],
-				social_links: [
-					{
-						"icon": "mdi:twitter",
-						"link": {
-							"url": "https://twitter.com",
-							"label": "Twitter"
-						}
-					},
-					{
-						"icon": "mdi:github",
-						"link": {
-							"url": "https://github.com",
-							"label": "Github"
-						}
 					}
 				],
 				title: "Portfolio Template",
@@ -4564,6 +4493,10 @@ function create_fragment$7(ctx) {
 						"link": { "url": "/projects", "label": "Projects" }
 					}
 				],
+				title: "Portfolio Template",
+				description: "Cupidatat est tempor",
+				heading: "Get in touch",
+				email: "someone@somewhere.com",
 				social_links: [
 					{
 						"icon": "mdi:twitter",
@@ -4581,11 +4514,7 @@ function create_fragment$7(ctx) {
 							"active": false
 						}
 					}
-				],
-				title: "Portfolio Template",
-				description: "Cupidatat est tempor",
-				heading: "Get in touch",
-				email: "someone@somewhere.com"
+				]
 			}
 		});
 
@@ -4607,22 +4536,6 @@ function create_fragment$7(ctx) {
 					},
 					{
 						"link": { "url": "/projects", "label": "Projects" }
-					}
-				],
-				social_links: [
-					{
-						"icon": "mdi:twitter",
-						"link": {
-							"url": "https://twitter.com",
-							"label": "Twitter"
-						}
-					},
-					{
-						"icon": "mdi:github",
-						"link": {
-							"url": "https://github.com",
-							"label": "Github"
-						}
 					}
 				],
 				title: "Portfolio Template",
