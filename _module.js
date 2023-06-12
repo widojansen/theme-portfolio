@@ -1,4 +1,5 @@
 function noop() { }
+const identity = x => x;
 function assign(tar, src) {
     // @ts-ignore
     for (const k in src)
@@ -37,6 +38,41 @@ function exclude_internal_props(props) {
         if (k[0] !== '$')
             result[k] = props[k];
     return result;
+}
+
+const is_client = typeof window !== 'undefined';
+let now = is_client
+    ? () => window.performance.now()
+    : () => Date.now();
+let raf = is_client ? cb => requestAnimationFrame(cb) : noop;
+
+const tasks = new Set();
+function run_tasks(now) {
+    tasks.forEach(task => {
+        if (!task.c(now)) {
+            tasks.delete(task);
+            task.f();
+        }
+    });
+    if (tasks.size !== 0)
+        raf(run_tasks);
+}
+/**
+ * Creates a new task that runs on each raf frame
+ * until it returns a falsy value or is aborted
+ */
+function loop(callback) {
+    let task;
+    if (tasks.size === 0)
+        raf(run_tasks);
+    return {
+        promise: new Promise(fulfill => {
+            tasks.add(task = { c: callback, f: fulfill });
+        }),
+        abort() {
+            tasks.delete(task);
+        }
+    };
 }
 
 // Track which nodes are claimed during hydration. Unclaimed nodes can then be removed from the DOM
@@ -140,6 +176,27 @@ function init_hydrate(target) {
         target.insertBefore(toMove[i], anchor);
     }
 }
+function append(target, node) {
+    target.appendChild(node);
+}
+function get_root_for_style(node) {
+    if (!node)
+        return document;
+    const root = node.getRootNode ? node.getRootNode() : node.ownerDocument;
+    if (root && root.host) {
+        return root;
+    }
+    return node.ownerDocument;
+}
+function append_empty_stylesheet(node) {
+    const style_element = element('style');
+    append_stylesheet(get_root_for_style(node), style_element);
+    return style_element.sheet;
+}
+function append_stylesheet(node, style) {
+    append(node.head || node, style);
+    return style.sheet;
+}
 function append_hydration(target, node) {
     if (is_hydrating) {
         init_hydrate(target);
@@ -197,6 +254,10 @@ function space() {
 }
 function empty() {
     return text('');
+}
+function listen(node, event, handler, options) {
+    node.addEventListener(event, handler, options);
+    return () => node.removeEventListener(event, handler, options);
 }
 function attr(node, attribute, value) {
     if (value == null)
@@ -368,6 +429,71 @@ function head_selector(nodeId, head) {
     return result;
 }
 
+// we need to store the information for multiple documents because a Svelte application could also contain iframes
+// https://github.com/sveltejs/svelte/issues/3624
+const managed_styles = new Map();
+let active = 0;
+// https://github.com/darkskyapp/string-hash/blob/master/index.js
+function hash(str) {
+    let hash = 5381;
+    let i = str.length;
+    while (i--)
+        hash = ((hash << 5) - hash) ^ str.charCodeAt(i);
+    return hash >>> 0;
+}
+function create_style_information(doc, node) {
+    const info = { stylesheet: append_empty_stylesheet(node), rules: {} };
+    managed_styles.set(doc, info);
+    return info;
+}
+function create_rule(node, a, b, duration, delay, ease, fn, uid = 0) {
+    const step = 16.666 / duration;
+    let keyframes = '{\n';
+    for (let p = 0; p <= 1; p += step) {
+        const t = a + (b - a) * ease(p);
+        keyframes += p * 100 + `%{${fn(t, 1 - t)}}\n`;
+    }
+    const rule = keyframes + `100% {${fn(b, 1 - b)}}\n}`;
+    const name = `__svelte_${hash(rule)}_${uid}`;
+    const doc = get_root_for_style(node);
+    const { stylesheet, rules } = managed_styles.get(doc) || create_style_information(doc, node);
+    if (!rules[name]) {
+        rules[name] = true;
+        stylesheet.insertRule(`@keyframes ${name} ${rule}`, stylesheet.cssRules.length);
+    }
+    const animation = node.style.animation || '';
+    node.style.animation = `${animation ? `${animation}, ` : ''}${name} ${duration}ms linear ${delay}ms 1 both`;
+    active += 1;
+    return name;
+}
+function delete_rule(node, name) {
+    const previous = (node.style.animation || '').split(', ');
+    const next = previous.filter(name
+        ? anim => anim.indexOf(name) < 0 // remove specific animation
+        : anim => anim.indexOf('__svelte') === -1 // remove all Svelte animations
+    );
+    const deleted = previous.length - next.length;
+    if (deleted) {
+        node.style.animation = next.join(', ');
+        active -= deleted;
+        if (!active)
+            clear_rules();
+    }
+}
+function clear_rules() {
+    raf(() => {
+        if (active)
+            return;
+        managed_styles.forEach(info => {
+            const { ownerNode } = info.stylesheet;
+            // there is no ownerNode if it runs on jsdom.
+            if (ownerNode)
+                detach(ownerNode);
+        });
+        managed_styles.clear();
+    });
+}
+
 let current_component;
 function set_current_component(component) {
     current_component = component;
@@ -534,6 +660,20 @@ function flush_render_callbacks(fns) {
     targets.forEach((c) => c());
     render_callbacks = filtered;
 }
+
+let promise;
+function wait() {
+    if (!promise) {
+        promise = Promise.resolve();
+        promise.then(() => {
+            promise = null;
+        });
+    }
+    return promise;
+}
+function dispatch(node, direction, kind) {
+    node.dispatchEvent(custom_event(`${direction ? 'intro' : 'outro'}${kind}`));
+}
 const outroing = new Set();
 let outros;
 function group_outros() {
@@ -573,6 +713,113 @@ function transition_out(block, local, detach, callback) {
     else if (callback) {
         callback();
     }
+}
+const null_transition = { duration: 0 };
+function create_bidirectional_transition(node, fn, params, intro) {
+    const options = { direction: 'both' };
+    let config = fn(node, params, options);
+    let t = intro ? 0 : 1;
+    let running_program = null;
+    let pending_program = null;
+    let animation_name = null;
+    function clear_animation() {
+        if (animation_name)
+            delete_rule(node, animation_name);
+    }
+    function init(program, duration) {
+        const d = (program.b - t);
+        duration *= Math.abs(d);
+        return {
+            a: t,
+            b: program.b,
+            d,
+            duration,
+            start: program.start,
+            end: program.start + duration,
+            group: program.group
+        };
+    }
+    function go(b) {
+        const { delay = 0, duration = 300, easing = identity, tick = noop, css } = config || null_transition;
+        const program = {
+            start: now() + delay,
+            b
+        };
+        if (!b) {
+            // @ts-ignore todo: improve typings
+            program.group = outros;
+            outros.r += 1;
+        }
+        if (running_program || pending_program) {
+            pending_program = program;
+        }
+        else {
+            // if this is an intro, and there's a delay, we need to do
+            // an initial tick and/or apply CSS animation immediately
+            if (css) {
+                clear_animation();
+                animation_name = create_rule(node, t, b, duration, delay, easing, css);
+            }
+            if (b)
+                tick(0, 1);
+            running_program = init(program, duration);
+            add_render_callback(() => dispatch(node, b, 'start'));
+            loop(now => {
+                if (pending_program && now > pending_program.start) {
+                    running_program = init(pending_program, duration);
+                    pending_program = null;
+                    dispatch(node, running_program.b, 'start');
+                    if (css) {
+                        clear_animation();
+                        animation_name = create_rule(node, t, running_program.b, running_program.duration, 0, easing, config.css);
+                    }
+                }
+                if (running_program) {
+                    if (now >= running_program.end) {
+                        tick(t = running_program.b, 1 - t);
+                        dispatch(node, running_program.b, 'end');
+                        if (!pending_program) {
+                            // we're done
+                            if (running_program.b) {
+                                // intro — we can tidy up immediately
+                                clear_animation();
+                            }
+                            else {
+                                // outro — needs to be coordinated
+                                if (!--running_program.group.r)
+                                    run_all(running_program.group.c);
+                            }
+                        }
+                        running_program = null;
+                    }
+                    else if (now >= running_program.start) {
+                        const p = now - running_program.start;
+                        t = running_program.a + running_program.d * easing(p / running_program.duration);
+                        tick(t, 1 - t);
+                    }
+                }
+                return !!(running_program || pending_program);
+            });
+        }
+    }
+    return {
+        run(b) {
+            if (is_function(config)) {
+                wait().then(() => {
+                    // @ts-ignore
+                    config = config(options);
+                    go(b);
+                });
+            }
+            else {
+                go(b);
+            }
+        },
+        end() {
+            clear_animation();
+            running_program = pending_program = null;
+        }
+    };
 }
 
 function get_spread_update(levels, updates) {
@@ -868,6 +1115,550 @@ class Component extends SvelteComponent {
 			site_nav: 3,
 			title: 1,
 			description: 2
+		});
+	}
+}
+
+function fade(node, { delay = 0, duration = 400, easing = identity } = {}) {
+    const o = +getComputedStyle(node).opacity;
+    return {
+        delay,
+        duration,
+        easing,
+        css: t => `opacity: ${t * o}`
+    };
+}
+
+/* generated by Svelte v3.58.0 */
+
+function get_each_context(ctx, list, i) {
+	const child_ctx = ctx.slice();
+	child_ctx[8] = list[i].link;
+	return child_ctx;
+}
+
+function get_each_context_1(ctx, list, i) {
+	const child_ctx = ctx.slice();
+	child_ctx[8] = list[i].link;
+	return child_ctx;
+}
+
+// (122:6) {#each site_nav as {link}}
+function create_each_block_1(ctx) {
+	let a;
+	let t_value = /*link*/ ctx[8].label + "";
+	let t;
+	let a_href_value;
+
+	return {
+		c() {
+			a = element("a");
+			t = text(t_value);
+			this.h();
+		},
+		l(nodes) {
+			a = claim_element(nodes, "A", { href: true, class: true });
+			var a_nodes = children(a);
+			t = claim_text(a_nodes, t_value);
+			a_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			attr(a, "href", a_href_value = /*link*/ ctx[8].url);
+			attr(a, "class", "link svelte-1z0hpmb");
+		},
+		m(target, anchor) {
+			insert_hydration(target, a, anchor);
+			append_hydration(a, t);
+		},
+		p(ctx, dirty) {
+			if (dirty & /*site_nav*/ 1 && t_value !== (t_value = /*link*/ ctx[8].label + "")) set_data(t, t_value);
+
+			if (dirty & /*site_nav*/ 1 && a_href_value !== (a_href_value = /*link*/ ctx[8].url)) {
+				attr(a, "href", a_href_value);
+			}
+		},
+		d(detaching) {
+			if (detaching) detach(a);
+		}
+	};
+}
+
+// (140:4) {#if mobileNavOpen}
+function create_if_block(ctx) {
+	let nav;
+	let a;
+	let t0;
+	let t1;
+	let t2;
+	let button;
+	let svg;
+	let path;
+	let nav_transition;
+	let current;
+	let mounted;
+	let dispose;
+	let each_value = /*site_nav*/ ctx[0];
+	let each_blocks = [];
+
+	for (let i = 0; i < each_value.length; i += 1) {
+		each_blocks[i] = create_each_block(get_each_context(ctx, each_value, i));
+	}
+
+	return {
+		c() {
+			nav = element("nav");
+			a = element("a");
+			t0 = text(name);
+			t1 = space();
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				each_blocks[i].c();
+			}
+
+			t2 = space();
+			button = element("button");
+			svg = svg_element("svg");
+			path = svg_element("path");
+			this.h();
+		},
+		l(nodes) {
+			nav = claim_element(nodes, "NAV", { id: true, class: true });
+			var nav_nodes = children(nav);
+			a = claim_element(nav_nodes, "A", { href: true, class: true });
+			var a_nodes = children(a);
+			t0 = claim_text(a_nodes, name);
+			a_nodes.forEach(detach);
+			t1 = claim_space(nav_nodes);
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				each_blocks[i].l(nav_nodes);
+			}
+
+			t2 = claim_space(nav_nodes);
+
+			button = claim_element(nav_nodes, "BUTTON", {
+				id: true,
+				"aria-label": true,
+				class: true
+			});
+
+			var button_nodes = children(button);
+
+			svg = claim_svg_element(button_nodes, "svg", {
+				xmlns: true,
+				viewBox: true,
+				fill: true,
+				class: true
+			});
+
+			var svg_nodes = children(svg);
+
+			path = claim_svg_element(svg_nodes, "path", {
+				fill: true,
+				"fill-rule": true,
+				d: true,
+				"clip-rule": true
+			});
+
+			children(path).forEach(detach);
+			svg_nodes.forEach(detach);
+			button_nodes.forEach(detach);
+			nav_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			attr(a, "href", "/");
+			attr(a, "class", "logo svelte-1z0hpmb");
+			attr(path, "fill", "currentColor");
+			attr(path, "fill-rule", "evenodd");
+			attr(path, "d", "M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z");
+			attr(path, "clip-rule", "evenodd");
+			attr(svg, "xmlns", "http://www.w3.org/2000/svg");
+			attr(svg, "viewBox", "0 0 20 20");
+			attr(svg, "fill", "currentColor");
+			attr(svg, "class", "svelte-1z0hpmb");
+			attr(button, "id", "close");
+			attr(button, "aria-label", "Close Navigation");
+			attr(button, "class", "svelte-1z0hpmb");
+			attr(nav, "id", "mobile-nav");
+			attr(nav, "class", "svelte-1z0hpmb");
+		},
+		m(target, anchor) {
+			insert_hydration(target, nav, anchor);
+			append_hydration(nav, a);
+			append_hydration(a, t0);
+			append_hydration(nav, t1);
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				if (each_blocks[i]) {
+					each_blocks[i].m(nav, null);
+				}
+			}
+
+			append_hydration(nav, t2);
+			append_hydration(nav, button);
+			append_hydration(button, svg);
+			append_hydration(svg, path);
+			current = true;
+
+			if (!mounted) {
+				dispose = listen(button, "click", /*click_handler_1*/ ctx[6]);
+				mounted = true;
+			}
+		},
+		p(ctx, dirty) {
+			if (dirty & /*site_nav*/ 1) {
+				each_value = /*site_nav*/ ctx[0];
+				let i;
+
+				for (i = 0; i < each_value.length; i += 1) {
+					const child_ctx = get_each_context(ctx, each_value, i);
+
+					if (each_blocks[i]) {
+						each_blocks[i].p(child_ctx, dirty);
+					} else {
+						each_blocks[i] = create_each_block(child_ctx);
+						each_blocks[i].c();
+						each_blocks[i].m(nav, t2);
+					}
+				}
+
+				for (; i < each_blocks.length; i += 1) {
+					each_blocks[i].d(1);
+				}
+
+				each_blocks.length = each_value.length;
+			}
+		},
+		i(local) {
+			if (current) return;
+
+			add_render_callback(() => {
+				if (!current) return;
+				if (!nav_transition) nav_transition = create_bidirectional_transition(nav, fade, { duration: 200 }, true);
+				nav_transition.run(1);
+			});
+
+			current = true;
+		},
+		o(local) {
+			if (!nav_transition) nav_transition = create_bidirectional_transition(nav, fade, { duration: 200 }, false);
+			nav_transition.run(0);
+			current = false;
+		},
+		d(detaching) {
+			if (detaching) detach(nav);
+			destroy_each(each_blocks, detaching);
+			if (detaching && nav_transition) nav_transition.end();
+			mounted = false;
+			dispose();
+		}
+	};
+}
+
+// (143:6) {#each site_nav as {link}}
+function create_each_block(ctx) {
+	let a;
+	let t_value = /*link*/ ctx[8].label + "";
+	let t;
+	let a_href_value;
+
+	return {
+		c() {
+			a = element("a");
+			t = text(t_value);
+			this.h();
+		},
+		l(nodes) {
+			a = claim_element(nodes, "A", { href: true, class: true });
+			var a_nodes = children(a);
+			t = claim_text(a_nodes, t_value);
+			a_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			attr(a, "href", a_href_value = /*link*/ ctx[8].url);
+			attr(a, "class", "link svelte-1z0hpmb");
+		},
+		m(target, anchor) {
+			insert_hydration(target, a, anchor);
+			append_hydration(a, t);
+		},
+		p(ctx, dirty) {
+			if (dirty & /*site_nav*/ 1 && t_value !== (t_value = /*link*/ ctx[8].label + "")) set_data(t, t_value);
+
+			if (dirty & /*site_nav*/ 1 && a_href_value !== (a_href_value = /*link*/ ctx[8].url)) {
+				attr(a, "href", a_href_value);
+			}
+		},
+		d(detaching) {
+			if (detaching) detach(a);
+		}
+	};
+}
+
+function create_fragment$1(ctx) {
+	let div3;
+	let div2;
+	let header;
+	let div1;
+	let nav;
+	let a;
+	let t0;
+	let t1;
+	let t2;
+	let div0;
+	let button;
+	let svg;
+	let path;
+	let t3;
+	let current;
+	let mounted;
+	let dispose;
+	let each_value_1 = /*site_nav*/ ctx[0];
+	let each_blocks = [];
+
+	for (let i = 0; i < each_value_1.length; i += 1) {
+		each_blocks[i] = create_each_block_1(get_each_context_1(ctx, each_value_1, i));
+	}
+
+	let if_block = /*mobileNavOpen*/ ctx[1] && create_if_block(ctx);
+
+	return {
+		c() {
+			div3 = element("div");
+			div2 = element("div");
+			header = element("header");
+			div1 = element("div");
+			nav = element("nav");
+			a = element("a");
+			t0 = text(name);
+			t1 = space();
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				each_blocks[i].c();
+			}
+
+			t2 = space();
+			div0 = element("div");
+			button = element("button");
+			svg = svg_element("svg");
+			path = svg_element("path");
+			t3 = space();
+			if (if_block) if_block.c();
+			this.h();
+		},
+		l(nodes) {
+			div3 = claim_element(nodes, "DIV", { class: true, id: true });
+			var div3_nodes = children(div3);
+			div2 = claim_element(div3_nodes, "DIV", { class: true });
+			var div2_nodes = children(div2);
+			header = claim_element(div2_nodes, "HEADER", { class: true });
+			var header_nodes = children(header);
+			div1 = claim_element(header_nodes, "DIV", { class: true });
+			var div1_nodes = children(div1);
+			nav = claim_element(div1_nodes, "NAV", { class: true });
+			var nav_nodes = children(nav);
+			a = claim_element(nav_nodes, "A", { href: true, class: true });
+			var a_nodes = children(a);
+			t0 = claim_text(a_nodes, name);
+			a_nodes.forEach(detach);
+			t1 = claim_space(nav_nodes);
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				each_blocks[i].l(nav_nodes);
+			}
+
+			nav_nodes.forEach(detach);
+			t2 = claim_space(div1_nodes);
+			div0 = claim_element(div1_nodes, "DIV", { class: true });
+			var div0_nodes = children(div0);
+
+			button = claim_element(div0_nodes, "BUTTON", {
+				id: true,
+				"aria-label": true,
+				class: true
+			});
+
+			var button_nodes = children(button);
+
+			svg = claim_svg_element(button_nodes, "svg", {
+				width: true,
+				height: true,
+				viewBox: true,
+				fill: true,
+				xmlns: true
+			});
+
+			var svg_nodes = children(svg);
+			path = claim_svg_element(svg_nodes, "path", { d: true, fill: true });
+			children(path).forEach(detach);
+			svg_nodes.forEach(detach);
+			button_nodes.forEach(detach);
+			div0_nodes.forEach(detach);
+			t3 = claim_space(div1_nodes);
+			if (if_block) if_block.l(div1_nodes);
+			div1_nodes.forEach(detach);
+			header_nodes.forEach(detach);
+			div2_nodes.forEach(detach);
+			div3_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			attr(a, "href", "/");
+			attr(a, "class", "logo svelte-1z0hpmb");
+			attr(nav, "class", "svelte-1z0hpmb");
+			attr(path, "d", "M19.4643 17.0213H0.535714C0.239866 17.0213 0 17.3071 0 17.6596V19.3617C0 19.7142 0.239866 20 0.535714 20H19.4643C19.7601 20 20 19.7142 20 19.3617V17.6596C20 17.3071 19.7601 17.0213 19.4643 17.0213ZM19.4643 8.51064H0.535714C0.239866 8.51064 0 8.79644 0 9.14894V10.8511C0 11.2036 0.239866 11.4894 0.535714 11.4894H19.4643C19.7601 11.4894 20 11.2036 20 10.8511V9.14894C20 8.79644 19.7601 8.51064 19.4643 8.51064ZM19.4643 0H0.535714C0.239866 0 0 0.285797 0 0.638296V2.34042C0 2.69292 0.239866 2.97872 0.535714 2.97872H19.4643C19.7601 2.97872 20 2.69292 20 2.34042V0.638296C20 0.285797 19.7601 0 19.4643 0Z");
+			attr(path, "fill", "currentColor");
+			attr(svg, "width", "20");
+			attr(svg, "height", "20");
+			attr(svg, "viewBox", "0 0 20 20");
+			attr(svg, "fill", "none");
+			attr(svg, "xmlns", "http://www.w3.org/2000/svg");
+			attr(button, "id", "open");
+			attr(button, "aria-label", "Open mobile navigation");
+			attr(button, "class", "svelte-1z0hpmb");
+			attr(div0, "class", "call-to-action svelte-1z0hpmb");
+			attr(div1, "class", "section-container svelte-1z0hpmb");
+			attr(header, "class", "svelte-1z0hpmb");
+			attr(div2, "class", "component");
+			attr(div3, "class", "section");
+			attr(div3, "id", "section-f0e5edee-3635-4a51-85f2-bb4284533c04");
+		},
+		m(target, anchor) {
+			insert_hydration(target, div3, anchor);
+			append_hydration(div3, div2);
+			append_hydration(div2, header);
+			append_hydration(header, div1);
+			append_hydration(div1, nav);
+			append_hydration(nav, a);
+			append_hydration(a, t0);
+			append_hydration(nav, t1);
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				if (each_blocks[i]) {
+					each_blocks[i].m(nav, null);
+				}
+			}
+
+			append_hydration(div1, t2);
+			append_hydration(div1, div0);
+			append_hydration(div0, button);
+			append_hydration(button, svg);
+			append_hydration(svg, path);
+			append_hydration(div1, t3);
+			if (if_block) if_block.m(div1, null);
+			current = true;
+
+			if (!mounted) {
+				dispose = listen(button, "click", /*click_handler*/ ctx[5]);
+				mounted = true;
+			}
+		},
+		p(ctx, [dirty]) {
+			if (dirty & /*site_nav*/ 1) {
+				each_value_1 = /*site_nav*/ ctx[0];
+				let i;
+
+				for (i = 0; i < each_value_1.length; i += 1) {
+					const child_ctx = get_each_context_1(ctx, each_value_1, i);
+
+					if (each_blocks[i]) {
+						each_blocks[i].p(child_ctx, dirty);
+					} else {
+						each_blocks[i] = create_each_block_1(child_ctx);
+						each_blocks[i].c();
+						each_blocks[i].m(nav, null);
+					}
+				}
+
+				for (; i < each_blocks.length; i += 1) {
+					each_blocks[i].d(1);
+				}
+
+				each_blocks.length = each_value_1.length;
+			}
+
+			if (/*mobileNavOpen*/ ctx[1]) {
+				if (if_block) {
+					if_block.p(ctx, dirty);
+
+					if (dirty & /*mobileNavOpen*/ 2) {
+						transition_in(if_block, 1);
+					}
+				} else {
+					if_block = create_if_block(ctx);
+					if_block.c();
+					transition_in(if_block, 1);
+					if_block.m(div1, null);
+				}
+			} else if (if_block) {
+				group_outros();
+
+				transition_out(if_block, 1, 1, () => {
+					if_block = null;
+				});
+
+				check_outros();
+			}
+		},
+		i(local) {
+			if (current) return;
+			transition_in(if_block);
+			current = true;
+		},
+		o(local) {
+			transition_out(if_block);
+			current = false;
+		},
+		d(detaching) {
+			if (detaching) detach(div3);
+			destroy_each(each_blocks, detaching);
+			if (if_block) if_block.d();
+			mounted = false;
+			dispose();
+		}
+	};
+}
+
+function instance$1($$self, $$props, $$invalidate) {
+	let { favicon } = $$props;
+	let { site_nav } = $$props;
+	let { title } = $$props;
+	let { description } = $$props;
+	let mobileNavOpen = false;
+
+	const click_handler = () => $$invalidate(1, mobileNavOpen = true);
+	const click_handler_1 = () => $$invalidate(1, mobileNavOpen = false);
+
+	$$self.$$set = $$props => {
+		if ('favicon' in $$props) $$invalidate(2, favicon = $$props.favicon);
+		if ('site_nav' in $$props) $$invalidate(0, site_nav = $$props.site_nav);
+		if ('title' in $$props) $$invalidate(3, title = $$props.title);
+		if ('description' in $$props) $$invalidate(4, description = $$props.description);
+	};
+
+	return [
+		site_nav,
+		mobileNavOpen,
+		favicon,
+		title,
+		description,
+		click_handler,
+		click_handler_1
+	];
+}
+
+class Component$1 extends SvelteComponent {
+	constructor(options) {
+		super();
+
+		init(this, options, instance$1, create_fragment$1, safe_not_equal, {
+			favicon: 2,
+			site_nav: 0,
+			title: 3,
+			description: 4
 		});
 	}
 }
@@ -2482,7 +3273,7 @@ var generateIcon_1 = generateIcon;
 
 /* generated by Svelte v3.58.0 */
 
-function create_if_block(ctx) {
+function create_if_block$1(ctx) {
 	let if_block_anchor;
 
 	function select_block_type(ctx, dirty) {
@@ -2599,9 +3390,9 @@ function create_if_block_1(ctx) {
 	};
 }
 
-function create_fragment$1(ctx) {
+function create_fragment$2(ctx) {
 	let if_block_anchor;
-	let if_block = /*data*/ ctx[0] && create_if_block(ctx);
+	let if_block = /*data*/ ctx[0] && create_if_block$1(ctx);
 
 	return {
 		c() {
@@ -2621,7 +3412,7 @@ function create_fragment$1(ctx) {
 				if (if_block) {
 					if_block.p(ctx, dirty);
 				} else {
-					if_block = create_if_block(ctx);
+					if_block = create_if_block$1(ctx);
 					if_block.c();
 					if_block.m(if_block_anchor.parentNode, if_block_anchor);
 				}
@@ -2639,7 +3430,7 @@ function create_fragment$1(ctx) {
 	};
 }
 
-function instance$1($$self, $$props, $$invalidate) {
+function instance$2($$self, $$props, $$invalidate) {
 	const state = {
 		// Last icon name
 		name: '',
@@ -2716,16 +3507,16 @@ function instance$1($$self, $$props, $$invalidate) {
 	return [data, state, mounted, counter];
 }
 
-class Component$1 extends SvelteComponent {
+class Component$2 extends SvelteComponent {
 	constructor(options) {
 		super();
-		init(this, options, instance$1, create_fragment$1, safe_not_equal, {});
+		init(this, options, instance$2, create_fragment$2, safe_not_equal, {});
 	}
 }
 
 /* generated by Svelte v3.58.0 */
 
-function get_each_context(ctx, list, i) {
+function get_each_context$1(ctx, list, i) {
 	const child_ctx = ctx.slice();
 	child_ctx[7] = list[i].link;
 	child_ctx[8] = list[i].icon;
@@ -2733,7 +3524,7 @@ function get_each_context(ctx, list, i) {
 }
 
 // (119:8) {#each social_links as { link, icon }}
-function create_each_block(ctx) {
+function create_each_block$1(ctx) {
 	let li;
 	let a;
 	let icon;
@@ -2744,7 +3535,7 @@ function create_each_block(ctx) {
 	let a_href_value;
 	let t2;
 	let current;
-	icon = new Component$1({ props: { icon: /*icon*/ ctx[8] } });
+	icon = new Component$2({ props: { icon: /*icon*/ ctx[8] } });
 
 	return {
 		c() {
@@ -2815,7 +3606,7 @@ function create_each_block(ctx) {
 	};
 }
 
-function create_fragment$2(ctx) {
+function create_fragment$3(ctx) {
 	let div4;
 	let div3;
 	let header;
@@ -2838,7 +3629,7 @@ function create_fragment$2(ctx) {
 	let each_blocks = [];
 
 	for (let i = 0; i < each_value.length; i += 1) {
-		each_blocks[i] = create_each_block(get_each_context(ctx, each_value, i));
+		each_blocks[i] = create_each_block$1(get_each_context$1(ctx, each_value, i));
 	}
 
 	const out = i => transition_out(each_blocks[i], 1, 1, () => {
@@ -2968,13 +3759,13 @@ function create_fragment$2(ctx) {
 				let i;
 
 				for (i = 0; i < each_value.length; i += 1) {
-					const child_ctx = get_each_context(ctx, each_value, i);
+					const child_ctx = get_each_context$1(ctx, each_value, i);
 
 					if (each_blocks[i]) {
 						each_blocks[i].p(child_ctx, dirty);
 						transition_in(each_blocks[i], 1);
 					} else {
-						each_blocks[i] = create_each_block(child_ctx);
+						each_blocks[i] = create_each_block$1(child_ctx);
 						each_blocks[i].c();
 						transition_in(each_blocks[i], 1);
 						each_blocks[i].m(ul, null);
@@ -3015,7 +3806,7 @@ function create_fragment$2(ctx) {
 	};
 }
 
-function instance$2($$self, $$props, $$invalidate) {
+function instance$3($$self, $$props, $$invalidate) {
 	let { favicon } = $$props;
 	let { site_nav } = $$props;
 	let { title } = $$props;
@@ -3037,11 +3828,11 @@ function instance$2($$self, $$props, $$invalidate) {
 	return [description, portrait, name, social_links, favicon, site_nav, title];
 }
 
-class Component$2 extends SvelteComponent {
+class Component$3 extends SvelteComponent {
 	constructor(options) {
 		super();
 
-		init(this, options, instance$2, create_fragment$2, safe_not_equal, {
+		init(this, options, instance$3, create_fragment$3, safe_not_equal, {
 			favicon: 4,
 			site_nav: 5,
 			title: 6,
@@ -3055,7 +3846,7 @@ class Component$2 extends SvelteComponent {
 
 /* generated by Svelte v3.58.0 */
 
-function create_fragment$3(ctx) {
+function create_fragment$4(ctx) {
 	let div3;
 	let div2;
 	let div1;
@@ -3109,7 +3900,7 @@ function create_fragment$3(ctx) {
 	};
 }
 
-function instance$3($$self, $$props, $$invalidate) {
+function instance$4($$self, $$props, $$invalidate) {
 	let { favicon } = $$props;
 	let { site_nav } = $$props;
 	let { title } = $$props;
@@ -3127,11 +3918,11 @@ function instance$3($$self, $$props, $$invalidate) {
 	return [content, favicon, site_nav, title, description];
 }
 
-class Component$3 extends SvelteComponent {
+class Component$4 extends SvelteComponent {
 	constructor(options) {
 		super();
 
-		init(this, options, instance$3, create_fragment$3, safe_not_equal, {
+		init(this, options, instance$4, create_fragment$4, safe_not_equal, {
 			favicon: 1,
 			site_nav: 2,
 			title: 3,
@@ -3143,20 +3934,20 @@ class Component$3 extends SvelteComponent {
 
 /* generated by Svelte v3.58.0 */
 
-function get_each_context$1(ctx, list, i) {
+function get_each_context$2(ctx, list, i) {
 	const child_ctx = ctx.slice();
 	child_ctx[6] = list[i];
 	return child_ctx;
 }
 
-function get_each_context_1(ctx, list, i) {
+function get_each_context_1$1(ctx, list, i) {
 	const child_ctx = ctx.slice();
 	child_ctx[9] = list[i].link;
 	return child_ctx;
 }
 
 // (78:12) {#each item.links as {link}}
-function create_each_block_1(ctx) {
+function create_each_block_1$1(ctx) {
 	let a;
 	let t_value = /*link*/ ctx[9].label + "";
 	let t;
@@ -3197,7 +3988,7 @@ function create_each_block_1(ctx) {
 }
 
 // (83:8) {#if item.thumbnail.url}
-function create_if_block$1(ctx) {
+function create_if_block$2(ctx) {
 	let img;
 	let img_src_value;
 	let img_alt_value;
@@ -3235,7 +4026,7 @@ function create_if_block$1(ctx) {
 }
 
 // (71:6) {#each items as item}
-function create_each_block$1(ctx) {
+function create_each_block$2(ctx) {
 	let li;
 	let div2;
 	let span;
@@ -3256,10 +4047,10 @@ function create_each_block$1(ctx) {
 	let each_blocks = [];
 
 	for (let i = 0; i < each_value_1.length; i += 1) {
-		each_blocks[i] = create_each_block_1(get_each_context_1(ctx, each_value_1, i));
+		each_blocks[i] = create_each_block_1$1(get_each_context_1$1(ctx, each_value_1, i));
 	}
 
-	let if_block = /*item*/ ctx[6].thumbnail.url && create_if_block$1(ctx);
+	let if_block = /*item*/ ctx[6].thumbnail.url && create_if_block$2(ctx);
 
 	return {
 		c() {
@@ -3359,12 +4150,12 @@ function create_each_block$1(ctx) {
 				let i;
 
 				for (i = 0; i < each_value_1.length; i += 1) {
-					const child_ctx = get_each_context_1(ctx, each_value_1, i);
+					const child_ctx = get_each_context_1$1(ctx, each_value_1, i);
 
 					if (each_blocks[i]) {
 						each_blocks[i].p(child_ctx, dirty);
 					} else {
-						each_blocks[i] = create_each_block_1(child_ctx);
+						each_blocks[i] = create_each_block_1$1(child_ctx);
 						each_blocks[i].c();
 						each_blocks[i].m(div1, null);
 					}
@@ -3381,7 +4172,7 @@ function create_each_block$1(ctx) {
 				if (if_block) {
 					if_block.p(ctx, dirty);
 				} else {
-					if_block = create_if_block$1(ctx);
+					if_block = create_if_block$2(ctx);
 					if_block.c();
 					if_block.m(li, t6);
 				}
@@ -3398,7 +4189,7 @@ function create_each_block$1(ctx) {
 	};
 }
 
-function create_fragment$4(ctx) {
+function create_fragment$5(ctx) {
 	let div2;
 	let div1;
 	let section;
@@ -3411,7 +4202,7 @@ function create_fragment$4(ctx) {
 	let each_blocks = [];
 
 	for (let i = 0; i < each_value.length; i += 1) {
-		each_blocks[i] = create_each_block$1(get_each_context$1(ctx, each_value, i));
+		each_blocks[i] = create_each_block$2(get_each_context$2(ctx, each_value, i));
 	}
 
 	return {
@@ -3491,12 +4282,12 @@ function create_fragment$4(ctx) {
 				let i;
 
 				for (i = 0; i < each_value.length; i += 1) {
-					const child_ctx = get_each_context$1(ctx, each_value, i);
+					const child_ctx = get_each_context$2(ctx, each_value, i);
 
 					if (each_blocks[i]) {
 						each_blocks[i].p(child_ctx, dirty);
 					} else {
-						each_blocks[i] = create_each_block$1(child_ctx);
+						each_blocks[i] = create_each_block$2(child_ctx);
 						each_blocks[i].c();
 						each_blocks[i].m(ul, null);
 					}
@@ -3518,7 +4309,7 @@ function create_fragment$4(ctx) {
 	};
 }
 
-function instance$4($$self, $$props, $$invalidate) {
+function instance$5($$self, $$props, $$invalidate) {
 	let { favicon } = $$props;
 	let { site_nav } = $$props;
 	let { title } = $$props;
@@ -3538,11 +4329,11 @@ function instance$4($$self, $$props, $$invalidate) {
 	return [heading, items, favicon, site_nav, title, description];
 }
 
-class Component$4 extends SvelteComponent {
+class Component$5 extends SvelteComponent {
 	constructor(options) {
 		super();
 
-		init(this, options, instance$4, create_fragment$4, safe_not_equal, {
+		init(this, options, instance$5, create_fragment$5, safe_not_equal, {
 			favicon: 2,
 			site_nav: 3,
 			title: 4,
@@ -3555,7 +4346,419 @@ class Component$4 extends SvelteComponent {
 
 /* generated by Svelte v3.58.0 */
 
-function get_each_context$2(ctx, list, i) {
+function get_each_context$3(ctx, list, i) {
+	const child_ctx = ctx.slice();
+	child_ctx[6] = list[i];
+	return child_ctx;
+}
+
+function get_each_context_1$2(ctx, list, i) {
+	const child_ctx = ctx.slice();
+	child_ctx[9] = list[i].link;
+	return child_ctx;
+}
+
+// (78:12) {#each item.links as {link}}
+function create_each_block_1$2(ctx) {
+	let a;
+	let t_value = /*link*/ ctx[9].label + "";
+	let t;
+	let a_href_value;
+
+	return {
+		c() {
+			a = element("a");
+			t = text(t_value);
+			this.h();
+		},
+		l(nodes) {
+			a = claim_element(nodes, "A", { class: true, href: true });
+			var a_nodes = children(a);
+			t = claim_text(a_nodes, t_value);
+			a_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			attr(a, "class", "link");
+			attr(a, "href", a_href_value = /*link*/ ctx[9].url);
+		},
+		m(target, anchor) {
+			insert_hydration(target, a, anchor);
+			append_hydration(a, t);
+		},
+		p(ctx, dirty) {
+			if (dirty & /*items*/ 2 && t_value !== (t_value = /*link*/ ctx[9].label + "")) set_data(t, t_value);
+
+			if (dirty & /*items*/ 2 && a_href_value !== (a_href_value = /*link*/ ctx[9].url)) {
+				attr(a, "href", a_href_value);
+			}
+		},
+		d(detaching) {
+			if (detaching) detach(a);
+		}
+	};
+}
+
+// (83:8) {#if item.thumbnail.url}
+function create_if_block$3(ctx) {
+	let img;
+	let img_src_value;
+	let img_alt_value;
+
+	return {
+		c() {
+			img = element("img");
+			this.h();
+		},
+		l(nodes) {
+			img = claim_element(nodes, "IMG", { src: true, alt: true, class: true });
+			this.h();
+		},
+		h() {
+			if (!src_url_equal(img.src, img_src_value = /*item*/ ctx[6].thumbnail.url)) attr(img, "src", img_src_value);
+			attr(img, "alt", img_alt_value = /*item*/ ctx[6].thumbnail.alt);
+			attr(img, "class", "svelte-hf1yy6");
+		},
+		m(target, anchor) {
+			insert_hydration(target, img, anchor);
+		},
+		p(ctx, dirty) {
+			if (dirty & /*items*/ 2 && !src_url_equal(img.src, img_src_value = /*item*/ ctx[6].thumbnail.url)) {
+				attr(img, "src", img_src_value);
+			}
+
+			if (dirty & /*items*/ 2 && img_alt_value !== (img_alt_value = /*item*/ ctx[6].thumbnail.alt)) {
+				attr(img, "alt", img_alt_value);
+			}
+		},
+		d(detaching) {
+			if (detaching) detach(img);
+		}
+	};
+}
+
+// (71:6) {#each items as item}
+function create_each_block$3(ctx) {
+	let li;
+	let div2;
+	let span;
+	let t0_value = /*item*/ ctx[6].date + "";
+	let t0;
+	let t1;
+	let h3;
+	let t2_value = /*item*/ ctx[6].title + "";
+	let t2;
+	let t3;
+	let div0;
+	let raw_value = /*item*/ ctx[6].description.html + "";
+	let t4;
+	let div1;
+	let t5;
+	let t6;
+	let each_value_1 = /*item*/ ctx[6].links;
+	let each_blocks = [];
+
+	for (let i = 0; i < each_value_1.length; i += 1) {
+		each_blocks[i] = create_each_block_1$2(get_each_context_1$2(ctx, each_value_1, i));
+	}
+
+	let if_block = /*item*/ ctx[6].thumbnail.url && create_if_block$3(ctx);
+
+	return {
+		c() {
+			li = element("li");
+			div2 = element("div");
+			span = element("span");
+			t0 = text(t0_value);
+			t1 = space();
+			h3 = element("h3");
+			t2 = text(t2_value);
+			t3 = space();
+			div0 = element("div");
+			t4 = space();
+			div1 = element("div");
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				each_blocks[i].c();
+			}
+
+			t5 = space();
+			if (if_block) if_block.c();
+			t6 = space();
+			this.h();
+		},
+		l(nodes) {
+			li = claim_element(nodes, "LI", { class: true });
+			var li_nodes = children(li);
+			div2 = claim_element(li_nodes, "DIV", { class: true });
+			var div2_nodes = children(div2);
+			span = claim_element(div2_nodes, "SPAN", { class: true });
+			var span_nodes = children(span);
+			t0 = claim_text(span_nodes, t0_value);
+			span_nodes.forEach(detach);
+			t1 = claim_space(div2_nodes);
+			h3 = claim_element(div2_nodes, "H3", { class: true });
+			var h3_nodes = children(h3);
+			t2 = claim_text(h3_nodes, t2_value);
+			h3_nodes.forEach(detach);
+			t3 = claim_space(div2_nodes);
+			div0 = claim_element(div2_nodes, "DIV", { class: true });
+			var div0_nodes = children(div0);
+			div0_nodes.forEach(detach);
+			t4 = claim_space(div2_nodes);
+			div1 = claim_element(div2_nodes, "DIV", { class: true });
+			var div1_nodes = children(div1);
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				each_blocks[i].l(div1_nodes);
+			}
+
+			div1_nodes.forEach(detach);
+			div2_nodes.forEach(detach);
+			t5 = claim_space(li_nodes);
+			if (if_block) if_block.l(li_nodes);
+			t6 = claim_space(li_nodes);
+			li_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			attr(span, "class", "date svelte-hf1yy6");
+			attr(h3, "class", "title svelte-hf1yy6");
+			attr(div0, "class", "description svelte-hf1yy6");
+			attr(div1, "class", "links svelte-hf1yy6");
+			attr(div2, "class", "post-info");
+			attr(li, "class", "svelte-hf1yy6");
+		},
+		m(target, anchor) {
+			insert_hydration(target, li, anchor);
+			append_hydration(li, div2);
+			append_hydration(div2, span);
+			append_hydration(span, t0);
+			append_hydration(div2, t1);
+			append_hydration(div2, h3);
+			append_hydration(h3, t2);
+			append_hydration(div2, t3);
+			append_hydration(div2, div0);
+			div0.innerHTML = raw_value;
+			append_hydration(div2, t4);
+			append_hydration(div2, div1);
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				if (each_blocks[i]) {
+					each_blocks[i].m(div1, null);
+				}
+			}
+
+			append_hydration(li, t5);
+			if (if_block) if_block.m(li, null);
+			append_hydration(li, t6);
+		},
+		p(ctx, dirty) {
+			if (dirty & /*items*/ 2 && t0_value !== (t0_value = /*item*/ ctx[6].date + "")) set_data(t0, t0_value);
+			if (dirty & /*items*/ 2 && t2_value !== (t2_value = /*item*/ ctx[6].title + "")) set_data(t2, t2_value);
+			if (dirty & /*items*/ 2 && raw_value !== (raw_value = /*item*/ ctx[6].description.html + "")) div0.innerHTML = raw_value;
+			if (dirty & /*items*/ 2) {
+				each_value_1 = /*item*/ ctx[6].links;
+				let i;
+
+				for (i = 0; i < each_value_1.length; i += 1) {
+					const child_ctx = get_each_context_1$2(ctx, each_value_1, i);
+
+					if (each_blocks[i]) {
+						each_blocks[i].p(child_ctx, dirty);
+					} else {
+						each_blocks[i] = create_each_block_1$2(child_ctx);
+						each_blocks[i].c();
+						each_blocks[i].m(div1, null);
+					}
+				}
+
+				for (; i < each_blocks.length; i += 1) {
+					each_blocks[i].d(1);
+				}
+
+				each_blocks.length = each_value_1.length;
+			}
+
+			if (/*item*/ ctx[6].thumbnail.url) {
+				if (if_block) {
+					if_block.p(ctx, dirty);
+				} else {
+					if_block = create_if_block$3(ctx);
+					if_block.c();
+					if_block.m(li, t6);
+				}
+			} else if (if_block) {
+				if_block.d(1);
+				if_block = null;
+			}
+		},
+		d(detaching) {
+			if (detaching) detach(li);
+			destroy_each(each_blocks, detaching);
+			if (if_block) if_block.d();
+		}
+	};
+}
+
+function create_fragment$6(ctx) {
+	let div2;
+	let div1;
+	let section;
+	let div0;
+	let h2;
+	let t0;
+	let t1;
+	let ul;
+	let each_value = /*items*/ ctx[1];
+	let each_blocks = [];
+
+	for (let i = 0; i < each_value.length; i += 1) {
+		each_blocks[i] = create_each_block$3(get_each_context$3(ctx, each_value, i));
+	}
+
+	return {
+		c() {
+			div2 = element("div");
+			div1 = element("div");
+			section = element("section");
+			div0 = element("div");
+			h2 = element("h2");
+			t0 = text(/*heading*/ ctx[0]);
+			t1 = space();
+			ul = element("ul");
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				each_blocks[i].c();
+			}
+
+			this.h();
+		},
+		l(nodes) {
+			div2 = claim_element(nodes, "DIV", { class: true, id: true });
+			var div2_nodes = children(div2);
+			div1 = claim_element(div2_nodes, "DIV", { class: true });
+			var div1_nodes = children(div1);
+			section = claim_element(div1_nodes, "SECTION", {});
+			var section_nodes = children(section);
+			div0 = claim_element(section_nodes, "DIV", { class: true });
+			var div0_nodes = children(div0);
+			h2 = claim_element(div0_nodes, "H2", { class: true });
+			var h2_nodes = children(h2);
+			t0 = claim_text(h2_nodes, /*heading*/ ctx[0]);
+			h2_nodes.forEach(detach);
+			t1 = claim_space(div0_nodes);
+			ul = claim_element(div0_nodes, "UL", { class: true });
+			var ul_nodes = children(ul);
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				each_blocks[i].l(ul_nodes);
+			}
+
+			ul_nodes.forEach(detach);
+			div0_nodes.forEach(detach);
+			section_nodes.forEach(detach);
+			div1_nodes.forEach(detach);
+			div2_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			attr(h2, "class", "heading svelte-hf1yy6");
+			attr(ul, "class", "items svelte-hf1yy6");
+			attr(div0, "class", "section-container");
+			attr(div1, "class", "component");
+			attr(div2, "class", "section");
+			attr(div2, "id", "section-c05d4945-4e29-4a9d-9ee7-e23145536334");
+		},
+		m(target, anchor) {
+			insert_hydration(target, div2, anchor);
+			append_hydration(div2, div1);
+			append_hydration(div1, section);
+			append_hydration(section, div0);
+			append_hydration(div0, h2);
+			append_hydration(h2, t0);
+			append_hydration(div0, t1);
+			append_hydration(div0, ul);
+
+			for (let i = 0; i < each_blocks.length; i += 1) {
+				if (each_blocks[i]) {
+					each_blocks[i].m(ul, null);
+				}
+			}
+		},
+		p(ctx, [dirty]) {
+			if (dirty & /*heading*/ 1) set_data(t0, /*heading*/ ctx[0]);
+
+			if (dirty & /*items*/ 2) {
+				each_value = /*items*/ ctx[1];
+				let i;
+
+				for (i = 0; i < each_value.length; i += 1) {
+					const child_ctx = get_each_context$3(ctx, each_value, i);
+
+					if (each_blocks[i]) {
+						each_blocks[i].p(child_ctx, dirty);
+					} else {
+						each_blocks[i] = create_each_block$3(child_ctx);
+						each_blocks[i].c();
+						each_blocks[i].m(ul, null);
+					}
+				}
+
+				for (; i < each_blocks.length; i += 1) {
+					each_blocks[i].d(1);
+				}
+
+				each_blocks.length = each_value.length;
+			}
+		},
+		i: noop,
+		o: noop,
+		d(detaching) {
+			if (detaching) detach(div2);
+			destroy_each(each_blocks, detaching);
+		}
+	};
+}
+
+function instance$6($$self, $$props, $$invalidate) {
+	let { favicon } = $$props;
+	let { site_nav } = $$props;
+	let { title } = $$props;
+	let { description } = $$props;
+	let { heading } = $$props;
+	let { items } = $$props;
+
+	$$self.$$set = $$props => {
+		if ('favicon' in $$props) $$invalidate(2, favicon = $$props.favicon);
+		if ('site_nav' in $$props) $$invalidate(3, site_nav = $$props.site_nav);
+		if ('title' in $$props) $$invalidate(4, title = $$props.title);
+		if ('description' in $$props) $$invalidate(5, description = $$props.description);
+		if ('heading' in $$props) $$invalidate(0, heading = $$props.heading);
+		if ('items' in $$props) $$invalidate(1, items = $$props.items);
+	};
+
+	return [heading, items, favicon, site_nav, title, description];
+}
+
+class Component$6 extends SvelteComponent {
+	constructor(options) {
+		super();
+
+		init(this, options, instance$6, create_fragment$6, safe_not_equal, {
+			favicon: 2,
+			site_nav: 3,
+			title: 4,
+			description: 5,
+			heading: 0,
+			items: 1
+		});
+	}
+}
+
+/* generated by Svelte v3.58.0 */
+
+function get_each_context$4(ctx, list, i) {
 	const child_ctx = ctx.slice();
 	child_ctx[6] = list[i].label;
 	child_ctx[7] = list[i].icon;
@@ -3563,7 +4766,7 @@ function get_each_context$2(ctx, list, i) {
 }
 
 // (45:4) {#each items as {label,icon}}
-function create_each_block$2(ctx) {
+function create_each_block$4(ctx) {
 	let li;
 	let icon;
 	let t0;
@@ -3572,7 +4775,7 @@ function create_each_block$2(ctx) {
 	let t1;
 	let t2;
 	let current;
-	icon = new Component$1({ props: { icon: /*icon*/ ctx[7] } });
+	icon = new Component$2({ props: { icon: /*icon*/ ctx[7] } });
 
 	return {
 		c() {
@@ -3631,7 +4834,7 @@ function create_each_block$2(ctx) {
 	};
 }
 
-function create_fragment$5(ctx) {
+function create_fragment$7(ctx) {
 	let div2;
 	let div1;
 	let section;
@@ -3647,7 +4850,7 @@ function create_fragment$5(ctx) {
 	let each_blocks = [];
 
 	for (let i = 0; i < each_value.length; i += 1) {
-		each_blocks[i] = create_each_block$2(get_each_context$2(ctx, each_value, i));
+		each_blocks[i] = create_each_block$4(get_each_context$4(ctx, each_value, i));
 	}
 
 	const out = i => transition_out(each_blocks[i], 1, 1, () => {
@@ -3738,13 +4941,13 @@ function create_fragment$5(ctx) {
 				let i;
 
 				for (i = 0; i < each_value.length; i += 1) {
-					const child_ctx = get_each_context$2(ctx, each_value, i);
+					const child_ctx = get_each_context$4(ctx, each_value, i);
 
 					if (each_blocks[i]) {
 						each_blocks[i].p(child_ctx, dirty);
 						transition_in(each_blocks[i], 1);
 					} else {
-						each_blocks[i] = create_each_block$2(child_ctx);
+						each_blocks[i] = create_each_block$4(child_ctx);
 						each_blocks[i].c();
 						transition_in(each_blocks[i], 1);
 						each_blocks[i].m(ul, null);
@@ -3785,7 +4988,7 @@ function create_fragment$5(ctx) {
 	};
 }
 
-function instance$5($$self, $$props, $$invalidate) {
+function instance$7($$self, $$props, $$invalidate) {
 	let { favicon } = $$props;
 	let { site_nav } = $$props;
 	let { title } = $$props;
@@ -3805,11 +5008,11 @@ function instance$5($$self, $$props, $$invalidate) {
 	return [description, heading, items, favicon, site_nav, title];
 }
 
-class Component$5 extends SvelteComponent {
+class Component$7 extends SvelteComponent {
 	constructor(options) {
 		super();
 
-		init(this, options, instance$5, create_fragment$5, safe_not_equal, {
+		init(this, options, instance$7, create_fragment$7, safe_not_equal, {
 			favicon: 3,
 			site_nav: 4,
 			title: 5,
@@ -3822,7 +5025,7 @@ class Component$5 extends SvelteComponent {
 
 /* generated by Svelte v3.58.0 */
 
-function get_each_context$3(ctx, list, i) {
+function get_each_context$5(ctx, list, i) {
 	const child_ctx = ctx.slice();
 	child_ctx[7] = list[i].link;
 	child_ctx[8] = list[i].icon;
@@ -3830,7 +5033,7 @@ function get_each_context$3(ctx, list, i) {
 }
 
 // (103:8) {#each social_links as {link, icon}}
-function create_each_block$3(ctx) {
+function create_each_block$5(ctx) {
 	let li;
 	let a;
 	let icon;
@@ -3838,7 +5041,7 @@ function create_each_block$3(ctx) {
 	let a_aria_label_value;
 	let t;
 	let current;
-	icon = new Component$1({ props: { icon: /*icon*/ ctx[8] } });
+	icon = new Component$2({ props: { icon: /*icon*/ ctx[8] } });
 
 	return {
 		c() {
@@ -3906,7 +5109,7 @@ function create_each_block$3(ctx) {
 	};
 }
 
-function create_fragment$6(ctx) {
+function create_fragment$8(ctx) {
 	let div4;
 	let div3;
 	let footer;
@@ -3937,12 +5140,12 @@ function create_fragment$6(ctx) {
 	let t11;
 	let ul;
 	let current;
-	icon = new Component$1({ props: { icon: "mdi:envelope" } });
+	icon = new Component$2({ props: { icon: "mdi:envelope" } });
 	let each_value = /*social_links*/ ctx[2];
 	let each_blocks = [];
 
 	for (let i = 0; i < each_value.length; i += 1) {
-		each_blocks[i] = create_each_block$3(get_each_context$3(ctx, each_value, i));
+		each_blocks[i] = create_each_block$5(get_each_context$5(ctx, each_value, i));
 	}
 
 	const out = i => transition_out(each_blocks[i], 1, 1, () => {
@@ -4113,13 +5316,13 @@ function create_fragment$6(ctx) {
 				let i;
 
 				for (i = 0; i < each_value.length; i += 1) {
-					const child_ctx = get_each_context$3(ctx, each_value, i);
+					const child_ctx = get_each_context$5(ctx, each_value, i);
 
 					if (each_blocks[i]) {
 						each_blocks[i].p(child_ctx, dirty);
 						transition_in(each_blocks[i], 1);
 					} else {
-						each_blocks[i] = create_each_block$3(child_ctx);
+						each_blocks[i] = create_each_block$5(child_ctx);
 						each_blocks[i].c();
 						transition_in(each_blocks[i], 1);
 						each_blocks[i].m(ul, null);
@@ -4163,7 +5366,7 @@ function create_fragment$6(ctx) {
 	};
 }
 
-function instance$6($$self, $$props, $$invalidate) {
+function instance$8($$self, $$props, $$invalidate) {
 	let { favicon } = $$props;
 	let { site_nav } = $$props;
 	let { title } = $$props;
@@ -4185,11 +5388,11 @@ function instance$6($$self, $$props, $$invalidate) {
 	return [heading, email, social_links, favicon, site_nav, title, description];
 }
 
-class Component$6 extends SvelteComponent {
+class Component$8 extends SvelteComponent {
 	constructor(options) {
 		super();
 
-		init(this, options, instance$6, create_fragment$6, safe_not_equal, {
+		init(this, options, instance$8, create_fragment$8, safe_not_equal, {
 			favicon: 3,
 			site_nav: 4,
 			title: 5,
@@ -4203,7 +5406,7 @@ class Component$6 extends SvelteComponent {
 
 /* generated by Svelte v3.58.0 */
 
-function instance$7($$self, $$props, $$invalidate) {
+function instance$9($$self, $$props, $$invalidate) {
 	let { favicon } = $$props;
 	let { site_nav } = $$props;
 	let { title } = $$props;
@@ -4219,11 +5422,11 @@ function instance$7($$self, $$props, $$invalidate) {
 	return [favicon, site_nav, title, description];
 }
 
-class Component$7 extends SvelteComponent {
+class Component$9 extends SvelteComponent {
 	constructor(options) {
 		super();
 
-		init(this, options, instance$7, null, safe_not_equal, {
+		init(this, options, instance$9, null, safe_not_equal, {
 			favicon: 0,
 			site_nav: 1,
 			title: 2,
@@ -4234,7 +5437,7 @@ class Component$7 extends SvelteComponent {
 
 /* generated by Svelte v3.58.0 */
 
-function create_fragment$7(ctx) {
+function create_fragment$9(ctx) {
 	let component_0;
 	let t0;
 	let component_1;
@@ -4248,6 +5451,10 @@ function create_fragment$7(ctx) {
 	let component_5;
 	let t5;
 	let component_6;
+	let t6;
+	let component_7;
+	let t7;
+	let component_8;
 	let current;
 
 	component_0 = new Component({
@@ -4270,12 +5477,31 @@ function create_fragment$7(ctx) {
 						"link": { "url": "/projects", "label": "Projects" }
 					}
 				],
-				title: "Portfolio Template",
+				title: "Portfolio Theme",
 				description: "Cupidatat est tempor"
 			}
 		});
 
-	component_1 = new Component$2({
+	component_1 = new Component$1({
+			props: {
+				favicon: {
+					"alt": "",
+					"src": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAGP0lEQVR42q1XA7AkyxKdNedNT49xd69t32+bzzbXtm3btm3btr3Bb1zlz5PRPVF/FhfxJiJnprOr8pxEZVVZXvKpwVLHfGjcuLHbbre/r2naTP49wvKQpdSQh9Dpuo5372OsYqe22KriB5Pkw0aTWWaz4b/xL5nCz6RK2DuMneVwOJLCbFb8Ubyuwd6OgHEFsNgQeF2mECiDznyvzmEbI9lWTcV2xeA2my2KJ19UgP/LUs5ClZRyzFGIXGQikRWRkBc8OJ3l78bE/5ieVlPKYMOw9XcmkfEiErVNzxVw8eBbEpVEZHhNmBVakwdcUDynCkUzRK8Uif+a6QCWii3hQLGEg4thp/58YAfr/S6y+1gwTwsHDJurRALF/X9RwHIJFY/O8oomhgWgnpX0gJsEwMZ6r5P02ID8t1ksInaXg0Tndoheii/oJq1OY9IjPGT3OEWv1hOWt0VZ67NZSJaQVSOZbKkvxvVIXwhEiLDRRvyMcd4/5pPntzk8tgZ0GAOCErlXMDfGL79wCHr8mqlgmSXgbrfbw8q/Shgb28r0SC/AWSyUurYrZZ8cTsEWvwIJ1jXgMRolzGhGWUeGUO75MZRzbjRlHhxEsWM+xRh4K6DRA96V90kL25AVerc4ABKIsjQr6ZhonTryabWV6E29Ic/TNvegvBuTKO/OFIqf/g01ZJ0zL44y9vSngrvTqODOVPwq/6dS6oZuEplGIL+xOxU+nEH5tyZT8rIO1BgkfJw+vwskioEJbIvG/Vu3MaMmnuJw8JzL4yh1W09y5sbCACIigHnXJlLW4SGUMLMZJc5tSdknhouu4N40SpzTkhrwWO/rRRK9fLaTf2sKJS9tDxuIEKRY5zoAtsVu403Ej5zXKVHBc6+Op7QdvcmR2lQmBj75CeVdmUD5NydTxs6+ZK8ptSCRcX03CYTE25yzo8n9i0x5532tkHJOjZQ5BbeZxJJ2SAdqpFQHEd7ALFw4D3W3AzkvS13XlcTIhdHiuSMtUoBAIHbUJ5TPRuBpsNkvRefIimaJEY+j+r8jc/OvT6Kmnf8sdQABiayjQynv6gRJVeL81tCXcbqxsh5a7AFXKTx3/zyDci+NY/AxlH1+FAVb/1a8cH43UbyMn/q15Dn3wljyvloQKjg9LiD/I5r/GuSERFS/t2Wu6wfJVJd/uUA5CiA3kXJOjyS7pZHZZ0otEo4mHmEbO/4zzvtYyjgxjFL39Sfvhz9EZMTb+ClfmQTEK1mi8UGscwGJn/YNwiyeRrT4NdmMeZG93qS8y+NBTuohqu9bgoXVxr2hFKvgoVSk11mGCTFjPqF0JpByaCAlchq8H/yA6rMeK8Ek4OMCsxoh1iw1xWPo4T2WJ8LbUMDfACGkBcJL8x1EBuBlRgQeIgJHdDy49BKwsmLi8A8oeX8/it/Wg2LXdiItJUhx4z+XFZB7cSx5fp9HjsxoSl3fjQElv6Fqj+z9phCO7P4aFy17zmFH6AEOUnpihHhuNL4j2ANmcASgLOaCBDvxLGLAWxS7qQtFr+lA/smfUsKiNhJihNOZH0+RPV6noqezzT4g9RMz9APMldCnbepBRU9mSeijB74r4I6kJqGDjbEnzJRGZLApsWsa2il6guTQ3+1PFLmiLXmnfUaJ23tSARcSgLx/yCM9ykcpKzpS+rbelDCrBRdmoQDrCUGZG/j0J5S+tZfkvJFRLwBXCQA71IpDBwjN2MWwH2AZdfgdOSd+RAkbuwoBswjhqdUQANiM3o9+j9VhM/RWYz/hCCuHFKUVh29GLGSSwG6oc5FZ38qnhC3dqYBznMvd0ffmdwTAwflEJLAUsRpCW7JNNjTskEip6nnYZqScfJWzHMRcp2JEltPg9yTf2ceGkSM9SjYmIWnVIM8/M1htqueq92SemNUDyQj1QKIePBBSDYXZ8jdmE0J0DJJVP5rh8KMeSGqwyO8Lj2QA8TmRTxM8zLPqH8lefCgNjwTrUGTomgCv5qH0b8BQMSs+lqs1UXUpV0/EsF3R3aCuEgmkwzRSXMX7QZkxp9ywcQE2q3Q7Qp5QLGFXsxLDcEn41Ux9p85BcatXsypfTrFcjMvpX6twOf2r0VuSq345ff713OyY72PveM71/BF0xtX9fYwNi+gLr+f/A6i9qhE6OU++AAAAAElFTkSuQmCC",
+					"url": "data:image/png;base64,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",
+					"size": null
+				},
+				site_nav: [
+					{ "link": { "url": "/", "label": "Home" } },
+					{
+						"link": { "url": "/", "label": "Projects" }
+					}
+				],
+				title: "Portfolio Theme",
+				description: "Cupidatat est tempor"
+			}
+		});
+
+	component_2 = new Component$3({
 			props: {
 				favicon: {
 					"alt": "",
@@ -4295,7 +5521,7 @@ function create_fragment$7(ctx) {
 						"link": { "url": "/projects", "label": "Projects" }
 					}
 				],
-				title: "Portfolio Template",
+				title: "Portfolio Theme",
 				description: {
 					"html": "<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Id praesent feugiat libero maecenas urna, vel.</p>",
 					"markdown": "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Id praesent feugiat libero maecenas urna, vel.\n\n"
@@ -4331,35 +5557,6 @@ function create_fragment$7(ctx) {
 			}
 		});
 
-	component_2 = new Component$3({
-			props: {
-				favicon: {
-					"alt": "",
-					"src": "data:image/png;base64,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",
-					"url": "data:image/png;base64,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",
-					"size": null
-				},
-				site_nav: [
-					{
-						"link": {
-							"url": "/",
-							"label": "Home",
-							"active": false
-						}
-					},
-					{
-						"link": { "url": "/projects", "label": "Projects" }
-					}
-				],
-				title: "Portfolio Template",
-				description: "Cupidatat est tempor",
-				content: {
-					"html": "<h2>Welcome to my portfolio</h2><p>This is some copy to help you get to know about my interests, experience, and top projects. I may share a few personal things here too.</p>",
-					"markdown": "## Welcome to my portfolio\n\nThis is some copy to help you get to know about my interests, experience, and top projects. I may share a few personal things here too.\n\n"
-				}
-			}
-		});
-
 	component_3 = new Component$4({
 			props: {
 				favicon: {
@@ -4380,7 +5577,36 @@ function create_fragment$7(ctx) {
 						"link": { "url": "/projects", "label": "Projects" }
 					}
 				],
-				title: "Portfolio Template",
+				title: "Portfolio Theme",
+				description: "Cupidatat est tempor",
+				content: {
+					"html": "<h2>Welcome to my portfolio</h2><p>This is some copy to help you get to know about my interests, experience, and top projects. I may share a few personal things here too.</p>",
+					"markdown": "## Welcome to my portfolio\n\nThis is some copy to help you get to know about my interests, experience, and top projects. I may share a few personal things here too.\n\n"
+				}
+			}
+		});
+
+	component_4 = new Component$5({
+			props: {
+				favicon: {
+					"alt": "",
+					"src": "data:image/png;base64,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",
+					"url": "data:image/png;base64,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",
+					"size": null
+				},
+				site_nav: [
+					{
+						"link": {
+							"url": "/",
+							"label": "Home",
+							"active": false
+						}
+					},
+					{
+						"link": { "url": "/projects", "label": "Projects" }
+					}
+				],
+				title: "Portfolio Theme",
 				description: "Cupidatat est tempor",
 				heading: "Featured Projects",
 				items: [
@@ -4429,50 +5655,6 @@ function create_fragment$7(ctx) {
 			}
 		});
 
-	component_4 = new Component$5({
-			props: {
-				favicon: {
-					"alt": "",
-					"src": "data:image/png;base64,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",
-					"url": "data:image/png;base64,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",
-					"size": null
-				},
-				site_nav: [
-					{
-						"link": {
-							"url": "/",
-							"label": "Home",
-							"active": false
-						}
-					},
-					{
-						"link": { "url": "/projects", "label": "Projects" }
-					}
-				],
-				title: "Portfolio Template",
-				description: {
-					"html": "<p>Some technologies i’ve been using lately:</p>",
-					"markdown": "Some technologies i’ve been using lately:\n\n"
-				},
-				heading: "Skills",
-				items: [
-					{
-						"icon": "akar-icons:javascript-fill",
-						"label": "JavaScript"
-					},
-					{ "icon": "cib:svelte", "label": "Svelte" },
-					{
-						"icon": "fontisto:html5",
-						"label": "HTML"
-					},
-					{
-						"icon": "mdi:language-css3",
-						"label": "CSS"
-					}
-				]
-			}
-		});
-
 	component_5 = new Component$6({
 			props: {
 				favicon: {
@@ -4493,25 +5675,49 @@ function create_fragment$7(ctx) {
 						"link": { "url": "/projects", "label": "Projects" }
 					}
 				],
-				title: "Portfolio Template",
+				title: "Portfolio Theme",
 				description: "Cupidatat est tempor",
-				heading: "Get in touch",
-				email: "someone@somewhere.com",
-				social_links: [
+				heading: "My Work",
+				items: [
 					{
-						"icon": "mdi:twitter",
-						"link": {
-							"url": "https://twitter.com",
-							"label": "Twitter",
-							"active": false
+						"date": "10.22.2023",
+						"links": [
+							{
+								"link": { "url": "", "label": "Check out app" }
+							}
+						],
+						"title": "Podcast Application",
+						"thumbnail": {
+							"alt": "",
+							"src": "https://images.unsplash.com/photo-1590602846989-e99596d2a6ee?ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D&auto=format&fit=crop&w=1770&q=80",
+							"url": "https://images.unsplash.com/photo-1590602846989-e99596d2a6ee?ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D&auto=format&fit=crop&w=1770&q=80",
+							"size": null
+						},
+						"description": {
+							"html": "<p>Worked on this as a passion project. The goal was to build a feature-rich podcast app with more playlist customization.</p>",
+							"markdown": "Worked on this as a passion project. The goal was to build a feature-rich podcast app with more playlist customization."
 						}
 					},
 					{
-						"icon": "mdi:github",
-						"link": {
-							"url": "https://github.com",
-							"label": "Github",
-							"active": false
+						"date": "3.25.2022",
+						"links": [
+							{
+								"link": { "url": "/", "label": "Download" }
+							},
+							{
+								"link": { "url": "/", "label": "Read more" }
+							}
+						],
+						"title": "Travel Web App",
+						"thumbnail": {
+							"alt": "",
+							"src": "https://images.unsplash.com/photo-1469854523086-cc02fe5d8800?ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D&auto=format&fit=crop&w=1721&q=80",
+							"url": "https://images.unsplash.com/photo-1469854523086-cc02fe5d8800?ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D&auto=format&fit=crop&w=1721&q=80",
+							"size": null
+						},
+						"description": {
+							"html": "<p>Designed and developed a travel app for a local travel agency. They needed a tailored app for their local customers.</p>",
+							"markdown": "Designed and developed a travel app for a local travel agency. They needed a tailored app for their local customers."
 						}
 					}
 				]
@@ -4538,7 +5744,96 @@ function create_fragment$7(ctx) {
 						"link": { "url": "/projects", "label": "Projects" }
 					}
 				],
-				title: "Portfolio Template",
+				title: "Portfolio Theme",
+				description: {
+					"html": "<p>Some technologies i’ve been using lately:</p>",
+					"markdown": "Some technologies i’ve been using lately:\n\n"
+				},
+				heading: "Skills",
+				items: [
+					{
+						"icon": "akar-icons:javascript-fill",
+						"label": "JavaScript"
+					},
+					{ "icon": "cib:svelte", "label": "Svelte" },
+					{
+						"icon": "fontisto:html5",
+						"label": "HTML"
+					},
+					{
+						"icon": "mdi:language-css3",
+						"label": "CSS"
+					}
+				]
+			}
+		});
+
+	component_7 = new Component$8({
+			props: {
+				favicon: {
+					"alt": "",
+					"src": "data:image/png;base64,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",
+					"url": "data:image/png;base64,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",
+					"size": null
+				},
+				site_nav: [
+					{
+						"link": {
+							"url": "/",
+							"label": "Home",
+							"active": false
+						}
+					},
+					{
+						"link": { "url": "/projects", "label": "Projects" }
+					}
+				],
+				title: "Portfolio Theme",
+				description: "Cupidatat est tempor",
+				heading: "Get in touch",
+				email: "someone@somewhere.com",
+				social_links: [
+					{
+						"icon": "mdi:twitter",
+						"link": {
+							"url": "https://twitter.com",
+							"label": "Twitter",
+							"active": false
+						}
+					},
+					{
+						"icon": "mdi:github",
+						"link": {
+							"url": "https://github.com",
+							"label": "Github",
+							"active": false
+						}
+					}
+				]
+			}
+		});
+
+	component_8 = new Component$9({
+			props: {
+				favicon: {
+					"alt": "",
+					"src": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAGP0lEQVR42q1XA7AkyxKdNedNT49xd69t32+bzzbXtm3btm3btr3Bb1zlz5PRPVF/FhfxJiJnprOr8pxEZVVZXvKpwVLHfGjcuLHbbre/r2naTP49wvKQpdSQh9Dpuo5372OsYqe22KriB5Pkw0aTWWaz4b/xL5nCz6RK2DuMneVwOJLCbFb8Ubyuwd6OgHEFsNgQeF2mECiDznyvzmEbI9lWTcV2xeA2my2KJ19UgP/LUs5ClZRyzFGIXGQikRWRkBc8OJ3l78bE/5ieVlPKYMOw9XcmkfEiErVNzxVw8eBbEpVEZHhNmBVakwdcUDynCkUzRK8Uif+a6QCWii3hQLGEg4thp/58YAfr/S6y+1gwTwsHDJurRALF/X9RwHIJFY/O8oomhgWgnpX0gJsEwMZ6r5P02ID8t1ksInaXg0Tndoheii/oJq1OY9IjPGT3OEWv1hOWt0VZ67NZSJaQVSOZbKkvxvVIXwhEiLDRRvyMcd4/5pPntzk8tgZ0GAOCErlXMDfGL79wCHr8mqlgmSXgbrfbw8q/Shgb28r0SC/AWSyUurYrZZ8cTsEWvwIJ1jXgMRolzGhGWUeGUO75MZRzbjRlHhxEsWM+xRh4K6DRA96V90kL25AVerc4ABKIsjQr6ZhonTryabWV6E29Ic/TNvegvBuTKO/OFIqf/g01ZJ0zL44y9vSngrvTqODOVPwq/6dS6oZuEplGIL+xOxU+nEH5tyZT8rIO1BgkfJw+vwskioEJbIvG/Vu3MaMmnuJw8JzL4yh1W09y5sbCACIigHnXJlLW4SGUMLMZJc5tSdknhouu4N40SpzTkhrwWO/rRRK9fLaTf2sKJS9tDxuIEKRY5zoAtsVu403Ej5zXKVHBc6+Op7QdvcmR2lQmBj75CeVdmUD5NydTxs6+ZK8ptSCRcX03CYTE25yzo8n9i0x5532tkHJOjZQ5BbeZxJJ2SAdqpFQHEd7ALFw4D3W3AzkvS13XlcTIhdHiuSMtUoBAIHbUJ5TPRuBpsNkvRefIimaJEY+j+r8jc/OvT6Kmnf8sdQABiayjQynv6gRJVeL81tCXcbqxsh5a7AFXKTx3/zyDci+NY/AxlH1+FAVb/1a8cH43UbyMn/q15Dn3wljyvloQKjg9LiD/I5r/GuSERFS/t2Wu6wfJVJd/uUA5CiA3kXJOjyS7pZHZZ0otEo4mHmEbO/4zzvtYyjgxjFL39Sfvhz9EZMTb+ClfmQTEK1mi8UGscwGJn/YNwiyeRrT4NdmMeZG93qS8y+NBTuohqu9bgoXVxr2hFKvgoVSk11mGCTFjPqF0JpByaCAlchq8H/yA6rMeK8Ek4OMCsxoh1iw1xWPo4T2WJ8LbUMDfACGkBcJL8x1EBuBlRgQeIgJHdDy49BKwsmLi8A8oeX8/it/Wg2LXdiItJUhx4z+XFZB7cSx5fp9HjsxoSl3fjQElv6Fqj+z9phCO7P4aFy17zmFH6AEOUnpihHhuNL4j2ANmcASgLOaCBDvxLGLAWxS7qQtFr+lA/smfUsKiNhJihNOZH0+RPV6noqezzT4g9RMz9APMldCnbepBRU9mSeijB74r4I6kJqGDjbEnzJRGZLApsWsa2il6guTQ3+1PFLmiLXmnfUaJ23tSARcSgLx/yCM9ykcpKzpS+rbelDCrBRdmoQDrCUGZG/j0J5S+tZfkvJFRLwBXCQA71IpDBwjN2MWwH2AZdfgdOSd+RAkbuwoBswjhqdUQANiM3o9+j9VhM/RWYz/hCCuHFKUVh29GLGSSwG6oc5FZ38qnhC3dqYBznMvd0ffmdwTAwflEJLAUsRpCW7JNNjTskEip6nnYZqScfJWzHMRcp2JEltPg9yTf2ceGkSM9SjYmIWnVIM8/M1htqueq92SemNUDyQj1QKIePBBSDYXZ8jdmE0J0DJJVP5rh8KMeSGqwyO8Lj2QA8TmRTxM8zLPqH8lefCgNjwTrUGTomgCv5qH0b8BQMSs+lqs1UXUpV0/EsF3R3aCuEgmkwzRSXMX7QZkxp9ywcQE2q3Q7Qp5QLGFXsxLDcEn41Ux9p85BcatXsypfTrFcjMvpX6twOf2r0VuSq345ff713OyY72PveM71/BF0xtX9fYwNi+gLr+f/A6i9qhE6OU++AAAAAElFTkSuQmCC",
+					"url": "data:image/png;base64,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",
+					"size": null
+				},
+				site_nav: [
+					{
+						"link": {
+							"url": "/",
+							"label": "Home",
+							"active": false
+						}
+					},
+					{
+						"link": { "url": "/projects", "label": "Projects" }
+					}
+				],
+				title: "Portfolio Theme",
 				description: "Cupidatat est tempor"
 			}
 		});
@@ -4558,6 +5853,10 @@ function create_fragment$7(ctx) {
 			create_component(component_5.$$.fragment);
 			t5 = space();
 			create_component(component_6.$$.fragment);
+			t6 = space();
+			create_component(component_7.$$.fragment);
+			t7 = space();
+			create_component(component_8.$$.fragment);
 		},
 		l(nodes) {
 			claim_component(component_0.$$.fragment, nodes);
@@ -4573,6 +5872,10 @@ function create_fragment$7(ctx) {
 			claim_component(component_5.$$.fragment, nodes);
 			t5 = claim_space(nodes);
 			claim_component(component_6.$$.fragment, nodes);
+			t6 = claim_space(nodes);
+			claim_component(component_7.$$.fragment, nodes);
+			t7 = claim_space(nodes);
+			claim_component(component_8.$$.fragment, nodes);
 		},
 		m(target, anchor) {
 			mount_component(component_0, target, anchor);
@@ -4588,6 +5891,10 @@ function create_fragment$7(ctx) {
 			mount_component(component_5, target, anchor);
 			insert_hydration(target, t5, anchor);
 			mount_component(component_6, target, anchor);
+			insert_hydration(target, t6, anchor);
+			mount_component(component_7, target, anchor);
+			insert_hydration(target, t7, anchor);
+			mount_component(component_8, target, anchor);
 			current = true;
 		},
 		p: noop,
@@ -4600,6 +5907,8 @@ function create_fragment$7(ctx) {
 			transition_in(component_4.$$.fragment, local);
 			transition_in(component_5.$$.fragment, local);
 			transition_in(component_6.$$.fragment, local);
+			transition_in(component_7.$$.fragment, local);
+			transition_in(component_8.$$.fragment, local);
 			current = true;
 		},
 		o(local) {
@@ -4610,6 +5919,8 @@ function create_fragment$7(ctx) {
 			transition_out(component_4.$$.fragment, local);
 			transition_out(component_5.$$.fragment, local);
 			transition_out(component_6.$$.fragment, local);
+			transition_out(component_7.$$.fragment, local);
+			transition_out(component_8.$$.fragment, local);
 			current = false;
 		},
 		d(detaching) {
@@ -4626,15 +5937,19 @@ function create_fragment$7(ctx) {
 			destroy_component(component_5, detaching);
 			if (detaching) detach(t5);
 			destroy_component(component_6, detaching);
+			if (detaching) detach(t6);
+			destroy_component(component_7, detaching);
+			if (detaching) detach(t7);
+			destroy_component(component_8, detaching);
 		}
 	};
 }
 
-class Component$8 extends SvelteComponent {
+class Component$a extends SvelteComponent {
 	constructor(options) {
 		super();
-		init(this, options, null, create_fragment$7, safe_not_equal, {});
+		init(this, options, null, create_fragment$9, safe_not_equal, {});
 	}
 }
 
-export default Component$8;
+export default Component$a;
